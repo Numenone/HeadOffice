@@ -37,7 +37,7 @@ export default function AgentDashboard() {
 
   // Função para buscar dados do banco (rápido, sem custo de IA)
   const fetchData = async () => {
-    const res = await fetch('SEU_RENDER_URL/api/dashboard-data');
+    const res = await fetch('https://headoffice.onrender.com/api/dashboard-data');
     const json = await res.json();
     setData(json);
   };
@@ -45,7 +45,7 @@ export default function AgentDashboard() {
   // Função para forçar atualização da IA (Custo de Tokens)
   const handleSync = async () => {
     setLoading(true);
-    await fetch('SEU_RENDER_URL/api/sync-agent', { method: 'POST' });
+    await fetch('https://headoffice.onrender.com/api/sync-agent', { method: 'POST' });
     await fetchData();
     setLoading(false);
   };
