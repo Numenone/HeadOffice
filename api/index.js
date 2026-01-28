@@ -61,18 +61,13 @@ function extractJSON(text) {
     return text;
 }
 
-// ======================================================
-// AS ROTAS QUE FALTAVAM (RESTAURADAS)
-// ======================================================
-
-// Rota para LISTAR empresas
+// --- ROTAS DE EMPRESAS ---
 app.get('/api/empresas', async (req, res) => {
     const { data, error } = await supabase.from('empresas').select('*').order('nome', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
     res.json(data);
 });
 
-// Rota para CRIAR empresa
 app.post('/api/empresas', async (req, res) => {
     const { nome } = req.body;
     if (!nome) return res.status(400).json({ error: "Nome obrigatório" });
@@ -82,7 +77,7 @@ app.post('/api/empresas', async (req, res) => {
 });
 
 // ======================================================
-// LÓGICA DE INTELIGÊNCIA ARTIFICIAL
+// LÓGICA DE INTELIGÊNCIA ARTIFICIAL (CORRIGIDA)
 // ======================================================
 
 app.post('/api/resumir-empresa', async (req, res) => {
@@ -119,7 +114,6 @@ app.post('/api/resumir-empresa', async (req, res) => {
                 },
                 headers: { 'Authorization': authHeader }
             });
-            // Busca em .text OU .answer
             const answerAI = aiSearch.data.text || aiSearch.data.answer || "";
             const matchAI = answerAI.match(/(https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+)/);
             if (matchAI) docUrl = matchAI[0];
@@ -156,9 +150,12 @@ app.post('/api/resumir-empresa', async (req, res) => {
             const isLast = i === chunks.length - 1;
             const safeMemory = currentMemory.length > 800 ? currentMemory.substring(0, 800) + "..." : currentMemory;
 
+            // MUDANÇA AQUI: Prompt mais rigoroso para não copiar exemplo
             const prompt = isLast 
-                ? `PARTE FINAL. Gere JSON estrito: {"resumo": "RESUMO AQUI", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico/Neutro", "status_projeto": "Em Dia/Atrasado"}`
-                : `Resuma brevemente este trecho e atualize o contexto.`;
+                ? `ANÁLISE FINAL. Com base em todo o contexto acumulado, gere o JSON REAL do projeto. 
+                   NÃO use textos de exemplo como "RESUMO AQUI". Preencha com os dados reais.
+                   JSON Obrigatório: {"resumo": "Descreva aqui o estado atual...", "pontos_importantes": "Liste os fatos...", "status_cliente": "Satisfeito/Crítico/Neutro", "status_projeto": "Em Dia/Atrasado"}`
+                : `Leia este trecho e atualize o resumo do que está acontecendo no projeto.`;
 
             let respostaIA = "";
             
@@ -168,36 +165,30 @@ app.post('/api/resumir-empresa', async (req, res) => {
                         params: {
                             aiName: BOT_NAME,
                             aiId: BOT_ID,
-                            context: `RESUMO ANTERIOR: ${safeMemory || "Nenhum"}\n\nTEXTO ATUAL:\n${chunk}`,
+                            context: `MEMÓRIA: ${safeMemory || "Nenhuma"}\n\nNOVO TEXTO:\n${chunk}`,
                             question: prompt
                         },
                         headers: { 'Authorization': authHeader }
                     });
                     
-                    // CORREÇÃO CRÍTICA: Lendo 'text'
                     const textoResposta = response.data.text || response.data.answer;
 
                     if (textoResposta && textoResposta.trim().length > 0) {
                         respostaIA = textoResposta;
                         break; 
                     }
-                    console.log(`[RETRY] Tentativa ${retry+1} falhou (vazia).`);
                 } catch (e) { console.error("Erro na chamada IA:", e.message); }
             }
 
             if (respostaIA) {
                 currentMemory = respostaIA;
-            } else {
-                console.warn(`[AVISO] Chunk ${i} ignorado.`);
             }
         }
 
         // 4. RESULTADO
         step = "Processando JSON";
         
-        if (!currentMemory) {
-             return res.json({ success: false, error: `IA muda. ID usado: ${BOT_ID}.` });
-        }
+        if (!currentMemory) return res.json({ success: false, error: `IA muda.` });
 
         const jsonOnly = extractJSON(currentMemory);
         let result = {};
@@ -205,6 +196,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
         try {
             result = JSON.parse(jsonOnly);
         } catch (e) {
+            // Se falhar o JSON, retorna o texto cru para debug
             result = { 
                 resumo: currentMemory.substring(0, 600), 
                 status_cliente: "Erro Parse", 
