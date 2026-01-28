@@ -20,7 +20,6 @@ const BASE_URL = 'https://api.headoffice.ai/v1';
 const SHEET_ID = '1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM';
 const SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=0`;
 
-// ID DO BOT ROGER
 const BOT_ID = '69372353b11d9df606b68bf8';
 const BOT_NAME = 'Roger';
 
@@ -31,19 +30,17 @@ app.get('/', (req, res) => {
     res.send(htmlComUrl);
 });
 
-// --- HELPER AUTH HEADOFFICE (SEM BEARER) ---
+// --- AUTH HELPERS ---
 function getHeadOfficeToken() {
     let rawToken = process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
-    
     if (rawToken.toLowerCase().startsWith('bearer')) {
         rawToken = rawToken.replace(/^bearer\s+/i, "").trim();
     }
     return rawToken.length > 10 ? rawToken : null;
 }
 
-// --- HELPER AUTH GOOGLE (GCP) ---
 function getGoogleAuth() {
     const privateKey = process.env.GOOGLE_PRIVATE_KEY 
         ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') 
@@ -62,32 +59,60 @@ function getGoogleAuth() {
     });
 }
 
-// --- UTILS ---
+// --- PARSER DE DATA (SUPORTE PT-BR "14 de jan.") ---
 function parseDateFromTitle(title) {
-    const regex = /(\d{1,2})[\/\.\-](\d{1,2})(?:[\/\.\-](\d{2,4}))?/;
-    const match = title.match(regex);
+    if (!title) return null;
+    const lower = title.toLowerCase();
+
+    // 1. Formato numérico (14/01/26, 14.01.2026)
+    const regexNum = /(\d{1,2})[\/\.\-](\d{1,2})(?:[\/\.\-](\d{2,4}))?/;
+    let match = lower.match(regexNum);
+    
     if (match) {
         const day = parseInt(match[1]);
-        const month = parseInt(match[2]) - 1; 
+        const month = parseInt(match[2]) - 1;
         let year = match[3] ? parseInt(match[3]) : new Date().getFullYear();
         if (year < 100) year += 2000;
         return new Date(year, month, day);
     }
+
+    // 2. Formato extenso (14 de jan, 14 jan)
+    const meses = { "jan": 0, "fev": 1, "mar": 2, "abr": 3, "mai": 4, "jun": 5, "jul": 6, "ago": 7, "set": 8, "out": 9, "nov": 10, "dez": 11 };
+    const regexExt = /(\d{1,2})\s*(?:de)?\s*([a-z]{3})/;
+    match = lower.match(regexExt);
+
+    if (match) {
+        const day = parseInt(match[1]);
+        const monthStr = match[2];
+        const month = meses[monthStr];
+        
+        // Tenta achar ano na string, senão usa atual
+        const yearMatch = lower.match(/20\d{2}/);
+        const year = yearMatch ? parseInt(yearMatch[0]) : new Date().getFullYear();
+
+        if (month !== undefined) return new Date(year, month, day);
+    }
+
     return null;
 }
 
+// --- EXTRATOR DE TEXTO (RECURSIVO & LIMPO) ---
 function readStructuralElements(elements) {
     let text = '';
     if (!elements) return text;
+
     elements.forEach(element => {
         if (element.paragraph) {
             element.paragraph.elements.forEach(el => {
-                if (el.textRun && el.textRun.content) text += el.textRun.content;
+                if (el.textRun && el.textRun.content) {
+                    text += el.textRun.content;
+                }
             });
+            text += "\n"; // Quebra de linha após parágrafo
         } else if (element.table) {
             element.table.tableRows.forEach(row => {
                 row.tableCells.forEach(cell => {
-                    text += readStructuralElements(cell.content) + " | "; 
+                    text += readStructuralElements(cell.content) + " "; 
                 });
                 text += "\n";
             });
@@ -106,17 +131,18 @@ function extractJSON(text) {
     return text;
 }
 
-// --- TRIMMER PARA ECONOMIZAR TOKENS E EVITAR 414 ---
-function filterContentForAI(text) {
+// --- SMART TRIMMER (FILTRO DE TRANSCRIÇÃO + COMPRESSÃO) ---
+function optimizeTextForGet(text) {
     if (!text) return "";
     
-    // Remove transcrições longas se identificadas
-    const stopWords = ["transcrição", "transcription", "gravação da reunião", "conversa na íntegra"];
+    // 1. Corta onde começa a transcrição (Lixo)
+    const stopWords = ["registros da reunião", "transcrição", "transcription", "gravação", "na íntegra"];
     let cutoffIndex = text.length;
     const lowerText = text.toLowerCase();
 
     for (const word of stopWords) {
         const idx = lowerText.indexOf(word);
+        // Só corta se a palavra aparecer depois dos primeiros 100 caracteres (pra não cortar título)
         if (idx !== -1 && idx < cutoffIndex && idx > 50) {
             cutoffIndex = idx;
         }
@@ -124,10 +150,18 @@ function filterContentForAI(text) {
 
     let cleanText = text.substring(0, cutoffIndex);
 
-    // Corte de segurança para URL GET (1500 chars)
-    if (cleanText.length > 1500) {
-        // Pega os primeiros 1000 e os últimos 500 (onde costumam estar as conclusões)
-        cleanText = cleanText.substring(0, 1000) + "\n...[MEIO OMITIDO]...\n" + cleanText.substring(cleanText.length - 500);
+    // 2. Remove linhas vazias e espaços duplos (Compactação)
+    cleanText = cleanText.replace(/\n\s*\n/g, '\n').replace(/\s+/g, ' ').trim();
+
+    // 3. Limite de segurança para URL (GET)
+    // O limite seguro é ~2000. O prompt ocupa ~800. Sobram ~1200.
+    const MAX_CHARS = 1200;
+    
+    if (cleanText.length > MAX_CHARS) {
+        // Prioriza o final do resumo (onde costumam estar os "Próximos Passos")
+        const start = cleanText.substring(0, 600);
+        const end = cleanText.substring(cleanText.length - 600);
+        return `${start} ... [MEIO RESUMIDO] ... ${end}`;
     }
 
     return cleanText;
@@ -135,52 +169,45 @@ function filterContentForAI(text) {
 
 // --- BUSCAR TODAS AS ABAS ---
 async function getAllTabsSorted(docId) {
-    try {
-        const auth = getGoogleAuth();
-        const client = await auth.getClient();
-        const docs = google.docs({ version: 'v1', auth: client });
+    const auth = getGoogleAuth();
+    const client = await auth.getClient();
+    const docs = google.docs({ version: 'v1', auth: client });
 
-        console.log(`[GCP] Baixando Doc: ${docId}`);
-        const res = await docs.documents.get({ documentId: docId });
-        const doc = res.data;
+    console.log(`[GCP] Baixando Doc: ${docId}`);
+    const res = await docs.documents.get({ documentId: docId });
+    const doc = res.data;
 
-        let tabsData = [];
+    let tabsData = [];
 
-        if (doc.tabs && doc.tabs.length > 0) {
-            doc.tabs.forEach(t => {
-                const title = t.tabProperties.title || "Sem Título";
-                const date = parseDateFromTitle(title);
-                let content = "";
-                if (t.documentTab && t.documentTab.body) {
-                    content = readStructuralElements(t.documentTab.body.content);
-                }
-                if (content.trim().length > 0) {
-                    tabsData.push({
-                        title: title,
-                        date: date,
-                        timestamp: date ? date.getTime() : 0, 
-                        content: content
-                    });
-                }
-            });
-        } 
-        
-        if (tabsData.length === 0) {
-            const bodyContent = readStructuralElements(doc.body.content);
-            if (bodyContent.trim().length > 0) {
-                tabsData.push({ title: "Geral", date: null, timestamp: 0, content: bodyContent });
+    // Processa Abas
+    if (doc.tabs && doc.tabs.length > 0) {
+        doc.tabs.forEach(t => {
+            const title = t.tabProperties.title || "Sem Título";
+            const date = parseDateFromTitle(title);
+            let content = "";
+            if (t.documentTab && t.documentTab.body) {
+                content = readStructuralElements(t.documentTab.body.content);
             }
+            if (content.trim().length > 0) {
+                tabsData.push({
+                    title: title,
+                    date: date,
+                    timestamp: date ? date.getTime() : 0, 
+                    content: content
+                });
+            }
+        });
+    } else {
+        // Fallback Corpo
+        const content = readStructuralElements(doc.body.content);
+        if (content.trim().length > 0) {
+            tabsData.push({ title: "Documento Principal", date: null, timestamp: 0, content: content });
         }
-
-        // Ordena: Antiga -> Recente
-        tabsData.sort((a, b) => a.timestamp - b.timestamp);
-        return tabsData;
-
-    } catch (error) {
-        if (error.code === 403) throw new Error(`Permissão negada. Compartilhe com: ${process.env.GOOGLE_CLIENT_EMAIL}`);
-        if (error.code === 404) throw new Error("Doc não encontrado.");
-        throw error;
     }
+
+    // Ordena: Antiga -> Recente
+    tabsData.sort((a, b) => a.timestamp - b.timestamp);
+    return tabsData;
 }
 
 // --- ROTAS CRUD ---
@@ -199,7 +226,7 @@ app.post('/api/empresas', async (req, res) => {
 });
 
 // ======================================================
-// LÓGICA DE INTELIGÊNCIA (SAFE GET + DIRECTOR MODE)
+// LÓGICA DE INTELIGÊNCIA (SAFE GET + DATA PT-BR)
 // ======================================================
 
 app.post('/api/resumir-empresa', async (req, res) => {
@@ -207,14 +234,13 @@ app.post('/api/resumir-empresa', async (req, res) => {
     const authHeader = getHeadOfficeToken();
     let debugLogs = [];
 
-    // --- CORREÇÃO: DECLARAÇÃO DE VARIÁVEIS NO ESCOPO SUPERIOR ---
-    let docId = null;
-    let docUrl = null;
-
     if (!authHeader) return res.status(500).json({ error: "Token HeadOffice inválido." });
 
     try {
         // 1. LINK NO CSV
+        let docId = null;
+        let docUrl = null;
+        
         try {
             const csvResponse = await axios.get(SHEET_CSV_URL);
             const lines = csvResponse.data.split('\n');
@@ -223,14 +249,14 @@ app.post('/api/resumir-empresa', async (req, res) => {
                     const match = line.match(/\/d\/([a-zA-Z0-9_-]+)/);
                     if (match) { 
                         docId = match[1];
-                        docUrl = `https://docs.google.com/document/d/${docId}`; // Atribuição correta
+                        docUrl = `https://docs.google.com/document/d/${docId}`;
                         break; 
                     }
                 }
             }
-        } catch (e) { console.warn("CSV falhou."); }
+        } catch (e) { console.warn("CSV Error"); }
 
-        if (!docId) return res.json({ success: false, error: `Link não encontrado para ${nome}.` });
+        if (!docId) return res.json({ success: false, error: `Link não encontrado na planilha.` });
 
         // 2. LER ABAS (GCP)
         let allTabs = [];
@@ -238,52 +264,53 @@ app.post('/api/resumir-empresa', async (req, res) => {
             allTabs = await getAllTabsSorted(docId);
             if (allTabs.length === 0) return res.json({ success: false, error: "Doc vazio." });
         } catch (apiError) {
-            return res.json({ success: false, error: apiError.message });
+            return res.json({ success: false, error: "Erro GCP: " + apiError.message });
         }
 
-        // 3. ANÁLISE CRONOLÓGICA (LOOP)
-        let currentMemory = "Nenhum histórico.";
-        console.log(`[IA] Processando ${allTabs.length} abas para ${nome}.`);
+        // 3. ANÁLISE EM CADEIA
+        let currentMemory = "Início.";
+        console.log(`[IA] Processando ${allTabs.length} abas.`);
 
         for (let i = 0; i < allTabs.length; i++) {
             const tab = allTabs[i];
             const isLast = i === allTabs.length - 1;
             
-            // Filtro para caber na URL
-            const cleanContent = filterContentForAI(tab.content);
+            // FILTRAGEM E COMPRESSÃO (CRUCIAL PARA GET)
+            // Remove transcrição e compacta espaços
+            const cleanContent = optimizeTextForGet(tab.content);
             
-            console.log(`[IA] Aba ${i+1}: ${tab.title}`);
+            console.log(`[IA] Aba ${i+1}: "${tab.title}" -> ${cleanContent.length} chars (Safe)`);
 
             let prompt = "";
             let contextForUrl = "";
 
             if (!isLast) {
-                // --- MODO: ACUMULAR MEMÓRIA ---
-                prompt = `ATUE COMO CS MANAGER.
-                REUNIÃO PASSADA: ${tab.title}.
-                INSTRUÇÃO: Atualize a memória com fatos cruciais (decisões/humor). Seja breve.`;
+                // MODO: HISTÓRICO
+                prompt = `ATUE COMO CS. Resumo da reunião anterior (${tab.title}).
+                Atualize a memória com fatos vitais (sentimento, entregas).
+                Seja ULTRA conciso.`;
                 
-                // Memória (500) + Texto (1500) = ~2000 chars (Safe for GET)
-                contextForUrl = `MEMÓRIA: ${currentMemory.slice(0, 500)}\n\nRESUMO DESTA REUNIÃO:\n${cleanContent}`;
+                // Memória compacta para não estourar URL
+                contextForUrl = `MEMÓRIA: ${currentMemory.substring(0, 400)}\n\nTEXTO: ${cleanContent}`;
 
             } else {
-                // --- MODO: DIRETOR DE CS (ÚLTIMA ABA) ---
+                // MODO: DIRETOR DE CS (ÚLTIMA ABA)
                 prompt = `ATUE COMO DIRETOR DE CS. ESTA É A ÚLTIMA REUNIÃO (${tab.title}).
                 
-                --- MISSÃO FINAL ---
+                --- MISSÃO ---
                 Gere o Relatório de Inteligência.
                 
                 REGRAS:
-                1. **Checkpoints/Próximos Passos:** Use SOMENTE o texto da "ÚLTIMA REUNIÃO" abaixo.
-                2. **Sentimento/Perfil:** Use o HISTÓRICO + ÚLTIMA REUNIÃO.
+                1. **Checkpoints/Próximos Passos:** Use EXCLUSIVAMENTE o "TEXTO DA REUNIÃO" abaixo. Se o texto mencionar "Felipe fará X", coloque isso.
+                2. **Sentimento/Perfil:** Use a MEMÓRIA + O TEXTO ATUAL.
                 
                 JSON ESTRITO:
                 {"resumo_executivo": "...", "perfil_cliente": "...", "estrategia_relacionamento": "...", "checkpoints_feitos": [], "proximos_passos": [], "riscos_bloqueios": "...", "sentimento_score": "0-10", "status_projeto": "Em Dia/Atrasado"}`;
 
-                contextForUrl = `HISTÓRICO: ${currentMemory.slice(0, 800)}\n\nÚLTIMA REUNIÃO:\n${cleanContent}`;
+                contextForUrl = `MEMÓRIA: ${currentMemory.substring(0, 600)}\n\nTEXTO DA REUNIÃO (IMPORTANTE):\n${cleanContent}`;
             }
 
-            // CHAMADA GET (Strict)
+            // CHAMADA GET (Safe)
             let respostaIA = "";
             for (let retry = 0; retry < 2; retry++) {
                 try {
@@ -295,7 +322,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
                             context: contextForUrl 
                         },
                         headers: { 'Authorization': authHeader },
-                        timeout: 30000
+                        timeout: 35000
                     });
                     
                     const tResp = response.data.text || response.data.answer;
@@ -305,12 +332,12 @@ app.post('/api/resumir-empresa', async (req, res) => {
                     }
                 } catch (e) { 
                     console.error(`Erro IA Aba ${i}: ${e.message}`);
-                    // Fallback extremo se der 414
                     if (e.response && e.response.status === 414) {
+                        // Retry com contexto minúsculo se der 414
                         try {
-                            const superSafeContext = contextForUrl.slice(0, 800); // Corta mais
+                            const tinyContext = contextForUrl.slice(0, 500); 
                             const r2 = await axios.get(`${BASE_URL}/openai/question`, {
-                                params: { aiName: BOT_NAME, aiId: BOT_ID, question: prompt, context: superSafeContext },
+                                params: { aiName: BOT_NAME, aiId: BOT_ID, question: prompt, context: tinyContext },
                                 headers: { 'Authorization': authHeader }
                             });
                             respostaIA = r2.data.text || r2.data.answer;
@@ -326,14 +353,15 @@ app.post('/api/resumir-empresa', async (req, res) => {
             }
         }
 
-        // 4. RENDERIZAÇÃO
+        // 4. FINALIZAR
         const jsonOnly = extractJSON(currentMemory);
         let data = {};
 
         try {
             data = JSON.parse(jsonOnly);
         } catch (e) {
-            data = { resumo_executivo: "Erro processamento. Logs: " + debugLogs.join(", ") };
+            // Se a IA alucinar texto plano, tentamos salvar no resumo
+            data = { resumo_executivo: currentMemory.substring(0, 500) };
         }
 
         const score = parseInt(data.sentimento_score) || 5;
@@ -347,12 +375,12 @@ app.post('/api/resumir-empresa', async (req, res) => {
             <div class="space-y-4 font-sans">
                 <div class="flex items-center justify-between mb-2">
                     <span class="text-[9px] uppercase font-mono text-indigo-300 bg-indigo-500/10 px-2 py-1 rounded border border-indigo-500/20">
-                        📅 Ref: ${lastTabName}
+                        📅 Fonte: ${lastTabName}
                     </span>
                 </div>
 
                 <div class="text-xs text-slate-300 leading-relaxed border-l-2 border-indigo-500 pl-3">
-                    ${data.resumo_executivo}
+                    ${data.resumo_executivo || "Sem resumo gerado."}
                 </div>
 
                 <div class="grid grid-cols-2 gap-2">
@@ -366,7 +394,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
                     <div class="bg-[#0f172a] p-2.5 rounded border border-white/5 hover:border-emerald-500/30 transition-colors">
                         <div class="flex items-center gap-2 mb-1">
                             <i data-lucide="compass" class="w-3 h-3 text-emerald-400"></i>
-                            <span class="text-[10px] font-bold text-emerald-200 uppercase tracking-wide">Ação</span>
+                            <span class="text-[10px] font-bold text-emerald-200 uppercase tracking-wide">Estratégia</span>
                         </div>
                         <p class="text-[10px] text-slate-400 leading-snug italic">"${data.estrategia_relacionamento || "-"}"</p>
                     </div>
@@ -383,7 +411,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
                     
                     ${(data.proximos_passos || []).length > 0 ? `
                     <div class="bg-indigo-500/[0.05] p-2 rounded border border-indigo-500/20">
-                        <h4 class="text-[10px] font-bold text-indigo-400 uppercase mb-2 flex items-center gap-1"><i data-lucide="arrow-right-circle" class="w-3 h-3"></i> Próximos</h4>
+                        <h4 class="text-[10px] font-bold text-indigo-400 uppercase mb-2 flex items-center gap-1"><i data-lucide="arrow-right-circle" class="w-3 h-3"></i> Próximos Passos</h4>
                         <ul class="space-y-1">
                             ${(data.proximos_passos || []).map(i => `<li class="text-[10px] text-indigo-200 flex items-start gap-2"><span class="w-1 h-1 bg-indigo-400 rounded-full mt-1.5"></span><span class="flex-1">${i}</span></li>`).join('')}
                         </ul>
@@ -405,7 +433,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
         `;
 
         const updatePayload = {
-            doc_link: docUrl, // Agora docUrl está garantido no escopo
+            doc_link: docUrl,
             resumo: htmlResumo,
             pontos_importantes: "Ver card",
             status_cliente: score >= 7 ? "Satisfeito" : (score <= 4 ? "Crítico" : "Neutro"),
@@ -418,10 +446,11 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
     } catch (error) {
         console.error(`[ERRO FATAL]:`, error.message);
-        res.status(500).json({ error: "Falha de processamento", details: error.message });
+        res.status(500).json({ error: "Falha técnica", details: error.message });
     }
 });
 
+// --- ROTA DE TESTE ---
 app.get('/api/debug-bot', async (req, res) => {
     try {
         const rawToken = getHeadOfficeToken();
