@@ -20,10 +20,40 @@ const SHEET_ID = '1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM';
 const SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=0`;
 const SHEET_FULL_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`;
 
+// ID DO BOT ROGER (Extraído do seu link)
+const BOT_ID = '69372353b11d9df606b68bf8';
+const BOT_NAME = 'Roger';
+
 app.get('/', (req, res) => {
     const currentUrl = `https://${req.headers.host}`;
     const htmlComUrl = DASHBOARD_HTML.replace('https://head-office-one.vercel.app', currentUrl);
     res.send(htmlComUrl);
+});
+
+// --- ROTA DE DIAGNÓSTICO (Teste Simples) ---
+// Acesse https://sua-url.vercel.app/api/debug-bot para testar se o Roger responde
+app.get('/api/debug-bot', async (req, res) => {
+    try {
+        const rawToken = getAuthToken();
+        if (!rawToken) return res.status(500).json({ error: "Sem token configurado" });
+
+        const response = await axios.get(`${BASE_URL}/openai/question`, {
+            params: {
+                aiName: BOT_NAME,
+                aiId: BOT_ID, // Forçando pelo ID
+                question: "Responda apenas com a palavra: FUNCIONANDO"
+            },
+            headers: { 'Authorization': rawToken }
+        });
+
+        res.json({
+            status: "Teste realizado",
+            resposta_ia: response.data.answer || "VAZIA",
+            dados_completos: response.data
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message, details: e.response?.data });
+    }
 });
 
 app.get('/api/empresas', async (req, res) => {
@@ -40,7 +70,17 @@ app.post('/api/empresas', async (req, res) => {
     res.json({ success: true, data });
 });
 
-// --- FUNÇÃO AUXILIAR: QUEBRAR TEXTO ---
+// --- HELPER AUTH ---
+function getAuthToken() {
+    const TOKEN_DE_EMERGENCIA = ""; 
+    let rawToken = TOKEN_DE_EMERGENCIA || process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
+    rawToken = rawToken.trim();
+    if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
+    if (rawToken.toLowerCase().startsWith('bearer ')) rawToken = rawToken.substring(7).trim();
+    return rawToken.length > 10 ? rawToken : null;
+}
+
+// --- HELPER QUEBRA DE TEXTO ---
 function splitText(text, chunkSize) {
     const chunks = [];
     for (let i = 0; i < text.length; i += chunkSize) {
@@ -49,7 +89,7 @@ function splitText(text, chunkSize) {
     return chunks;
 }
 
-// --- FUNÇÃO AUXILIAR: EXTRAIR JSON ---
+// --- HELPER EXTRAIR JSON ---
 function extractJSON(text) {
     if (!text) return null;
     const start = text.indexOf('{');
@@ -60,23 +100,12 @@ function extractJSON(text) {
     return text;
 }
 
-// --- ROTA DE RESUMO ---
+// --- ROTA PRINCIPAL ---
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
-    
-    // --- AUTENTICAÇÃO ---
-    const TOKEN_DE_EMERGENCIA = ""; 
-    let rawToken = TOKEN_DE_EMERGENCIA || process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
-    
-    rawToken = rawToken.trim();
-    if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
-    
-    const authHeader = rawToken;
+    const authHeader = getAuthToken();
 
-    // DEBUG: Mostra início do token nos logs para garantir que está lendo
-    console.log(`[DEBUG] Token sendo usado (início): ${rawToken.substring(0, 5)}...`);
-
-    if (rawToken.length < 10) return res.status(500).json({ error: "API Key/Token inválido." });
+    if (!authHeader) return res.status(500).json({ error: "Token inválido." });
 
     let step = "Início";
     let docUrl = null;
@@ -97,9 +126,11 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
         if (!docUrl) {
             step = "Buscando Link via IA";
+            // Aqui usamos ID e Nome para garantir
             const aiSearch = await axios.get(`${BASE_URL}/openai/question`, {
                 params: {
-                    aiName: 'Roger', 
+                    aiName: BOT_NAME,
+                    aiId: BOT_ID,
                     context: `Planilha: ${SHEET_FULL_URL}`,
                     question: `Encontre a empresa "${nome}". Extraia a URL do Docs.`
                 },
@@ -112,7 +143,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
         if (!docUrl) return res.json({ success: false, error: `Link não encontrado para ${nome}.` });
 
-        // 2. Baixar Texto Completo
+        // 2. Baixar Texto
         step = `Baixando Texto`;
         const txtUrl = `${docUrl}/export?format=txt`;
         let fullText = "";
@@ -120,80 +151,81 @@ app.post('/api/resumir-empresa', async (req, res) => {
             const textResponse = await axios.get(txtUrl);
             fullText = typeof textResponse.data === 'string' ? textResponse.data : JSON.stringify(textResponse.data);
             
-            // DEBUG: Mostra o começo do texto baixado para garantir que não é HTML de login
-            console.log(`[DEBUG] Texto baixado (primeiros 100 chars): ${fullText.substring(0, 100)}`);
-
+            if (!fullText || fullText.length < 50) return res.json({ success: false, error: "Doc vazio ou muito curto." });
             if (fullText.includes("<!DOCTYPE html>") || fullText.includes("Google Accounts")) {
-                return res.json({ success: false, error: "O Google retornou página de Login. O Doc precisa ser Público." });
-            }
-            if (fullText.length < 50) {
-                return res.json({ success: false, error: "O documento baixado está vazio ou muito curto." });
+                return res.json({ success: false, error: "Doc privado. Libere o acesso." });
             }
         } catch (downloadError) {
-            return res.json({ success: false, error: "Falha ao baixar texto do Doc (404/403)." });
+            return res.json({ success: false, error: "Falha ao baixar Doc (404/403)." });
         }
 
-        // 3. ESTRATÉGIA CHAIN (Reduzida para garantir resposta)
+        // 3. ANÁLISE EM CADEIA (CHAIN)
         step = "Análise Contínua";
-        
-        // Pega os últimos 10.000 chars (reduzi para ser mais seguro)
-        const relevantText = fullText.slice(-10000); 
-        // Chunk de 1.800 chars
-        const chunks = splitText(relevantText, 1800);
-        console.log(`[CHAIN] Analisando ${chunks.length} partes...`);
+        const relevantText = fullText.slice(-12000); // 12k chars para segurança
+        const chunks = splitText(relevantText, 2000);
+        console.log(`[CHAIN] ${chunks.length} partes.`);
 
         let currentMemory = "";
 
         for (let i = 0; i < chunks.length; i++) {
             const chunk = chunks[i];
             const isLast = i === chunks.length - 1;
-            
-            const safeMemory = currentMemory.length > 500 ? currentMemory.substring(0, 500) + "..." : currentMemory;
+            const safeMemory = currentMemory.length > 800 ? currentMemory.substring(0, 800) + "..." : currentMemory;
 
-            // Prompt simplificado para evitar confusão da IA
             const prompt = isLast 
                 ? `PARTE FINAL. Gere JSON estrito: {"resumo": "RESUMO AQUI", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico/Neutro", "status_projeto": "Em Dia/Atrasado"}`
-                : `Resuma brevemente o que aconteceu aqui.`;
+                : `Resuma brevemente este trecho e atualize o contexto.`;
 
-            // DEBUG: Log antes de enviar
-            console.log(`[DEBUG] Enviando Parte ${i+1}/${chunks.length}...`);
-
-            const response = await axios.get(`${BASE_URL}/openai/question`, {
-                params: {
-                    aiName: 'Roger', // VERIFIQUE SE O NOME DO SEU BOT É EXATAMENTE "Roger"
-                    context: `RESUMO ANTERIOR: ${safeMemory || "Nenhum"}\n\nTEXTO ATUAL:\n${chunk}`,
-                    question: prompt
-                },
-                headers: { 'Authorization': authHeader }
-            });
+            // TENTATIVA DE RESPOSTA ROBUSTA
+            // Se falhar (vazio), tenta mais uma vez com prompt simplificado
+            let respostaIA = "";
             
-            const respostaIA = response.data.answer;
-            
-            // DEBUG: Log da resposta da IA
-            console.log(`[DEBUG] Resposta IA (Parte ${i+1}):`, respostaIA ? respostaIA.substring(0, 50) + "..." : "VAZIA/NULL");
+            for (let retry = 0; retry < 2; retry++) {
+                try {
+                    const response = await axios.get(`${BASE_URL}/openai/question`, {
+                        params: {
+                            aiName: BOT_NAME,
+                            aiId: BOT_ID, // Passando o ID explicitamente
+                            context: `RESUMO ANTERIOR: ${safeMemory || "Nenhum"}\n\nTEXTO ATUAL:\n${chunk}`,
+                            question: prompt
+                        },
+                        headers: { 'Authorization': authHeader }
+                    });
+                    
+                    if (response.data.answer && response.data.answer.trim().length > 0) {
+                        respostaIA = response.data.answer;
+                        break; // Sucesso, sai do retry
+                    }
+                    console.log(`[RETRY] Tentativa ${retry+1} falhou (vazia).`);
+                } catch (e) { console.error("Erro na chamada IA:", e.message); }
+            }
 
             if (respostaIA) {
                 currentMemory = respostaIA;
+            } else {
+                console.warn(`[AVISO] O chunk ${i} foi ignorado pois a IA não respondeu.`);
             }
         }
 
-        // 4. TRATAMENTO FINAL
+        // 4. RESULTADO
         step = "Processando JSON";
-        let result = {};
         
         if (!currentMemory) {
-             // Se chegou aqui vazio, é porque a IA retornou string vazia em TODAS as tentativas
-             return res.json({ success: false, error: "A IA retornou vazio. Verifique se o nome do bot ('Roger') está correto no HeadOffice." });
+             // Debug detalhado no erro
+             return res.json({ 
+                 success: false, 
+                 error: `IA muda. ID usado: ${BOT_ID}. Verifique em /api/debug-bot se ela responde.` 
+             });
         }
 
         const jsonOnly = extractJSON(currentMemory);
+        let result = {};
 
         try {
             result = JSON.parse(jsonOnly);
         } catch (e) {
-            console.error("[PARSE ERROR]", currentMemory);
             result = { 
-                resumo: currentMemory.substring(0, 600), // Salva o texto cru se não for JSON
+                resumo: currentMemory.substring(0, 600), 
                 status_cliente: "Erro Parse", 
                 status_projeto: "Erro Parse" 
             };
@@ -212,9 +244,8 @@ app.post('/api/resumir-empresa', async (req, res) => {
         res.json({ success: true, data: updatePayload });
 
     } catch (error) {
-        console.error(`[ERRO CRÍTICO] ${step}:`, error.message);
-        const errorDetail = error.response ? JSON.stringify(error.response.data) : error.message;
-        res.status(500).json({ error: "Falha técnica", step, details: errorDetail });
+        console.error(`[ERRO FATAL] ${step}:`, error.message);
+        res.status(500).json({ error: "Erro Interno", step, details: error.message });
     }
 });
 
