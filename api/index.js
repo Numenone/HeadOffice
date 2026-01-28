@@ -59,14 +59,30 @@ function getGoogleAuth() {
     });
 }
 
-// --- PARSER DE DATA (SUPORTE PT-BR "14 de jan.") ---
+// --- PARSER DE DATA (PT-BR) ---
 function parseDateFromTitle(title) {
     if (!title) return null;
     const lower = title.toLowerCase();
 
-    // 1. Formato numérico (14/01/26, 14.01.2026)
+    // Formato extenso: "14 de jan." ou "14 jan"
+    const meses = { "jan": 0, "fev": 1, "mar": 2, "abr": 3, "mai": 4, "jun": 5, "jul": 6, "ago": 7, "set": 8, "out": 9, "nov": 10, "dez": 11 };
+    const regexExt = /(\d{1,2})\s*(?:de)?\s*([a-z]{3})/;
+    let match = lower.match(regexExt);
+
+    if (match) {
+        const day = parseInt(match[1]);
+        const monthStr = match[2]; 
+        const month = meses[monthStr];
+        
+        const yearMatch = lower.match(/20\d{2}/);
+        const year = yearMatch ? parseInt(yearMatch[0]) : new Date().getFullYear();
+
+        if (month !== undefined) return new Date(year, month, day);
+    }
+
+    // Formato numérico: "14/01/26"
     const regexNum = /(\d{1,2})[\/\.\-](\d{1,2})(?:[\/\.\-](\d{2,4}))?/;
-    let match = lower.match(regexNum);
+    match = lower.match(regexNum);
     
     if (match) {
         const day = parseInt(match[1]);
@@ -76,27 +92,10 @@ function parseDateFromTitle(title) {
         return new Date(year, month, day);
     }
 
-    // 2. Formato extenso (14 de jan, 14 jan)
-    const meses = { "jan": 0, "fev": 1, "mar": 2, "abr": 3, "mai": 4, "jun": 5, "jul": 6, "ago": 7, "set": 8, "out": 9, "nov": 10, "dez": 11 };
-    const regexExt = /(\d{1,2})\s*(?:de)?\s*([a-z]{3})/;
-    match = lower.match(regexExt);
-
-    if (match) {
-        const day = parseInt(match[1]);
-        const monthStr = match[2];
-        const month = meses[monthStr];
-        
-        // Tenta achar ano na string, senão usa atual
-        const yearMatch = lower.match(/20\d{2}/);
-        const year = yearMatch ? parseInt(yearMatch[0]) : new Date().getFullYear();
-
-        if (month !== undefined) return new Date(year, month, day);
-    }
-
     return null;
 }
 
-// --- EXTRATOR DE TEXTO (RECURSIVO & LIMPO) ---
+// --- EXTRATOR DE TEXTO ---
 function readStructuralElements(elements) {
     let text = '';
     if (!elements) return text;
@@ -108,7 +107,7 @@ function readStructuralElements(elements) {
                     text += el.textRun.content;
                 }
             });
-            text += "\n"; // Quebra de linha após parágrafo
+            text += "\n"; 
         } else if (element.table) {
             element.table.tableRows.forEach(row => {
                 row.tableCells.forEach(cell => {
@@ -131,43 +130,51 @@ function extractJSON(text) {
     return text;
 }
 
-// --- SMART TRIMMER (FILTRO DE TRANSCRIÇÃO + COMPRESSÃO) ---
+// --- CORTE CIRÚRGICO (NOVO!) ---
 function optimizeTextForGet(text) {
     if (!text) return "";
     
-    // 1. Corta onde começa a transcrição (Lixo)
-    const stopWords = ["registros da reunião", "transcrição", "transcription", "gravação", "na íntegra"];
-    let cutoffIndex = text.length;
-    const lowerText = text.toLowerCase();
+    // 1. Identifica onde começa o lixo (Rodapé do Google Meet)
+    const lower = text.toLowerCase();
+    
+    // Palavras que indicam o fim do conteúdo útil e começo do log de áudio
+    const endMarkers = [
+        "revise as anotações do gemini", 
+        "00:00:00", // Começo do timestamp
+        "envie feedback sobre o uso"
+    ];
 
-    for (const word of stopWords) {
-        const idx = lowerText.indexOf(word);
-        // Só corta se a palavra aparecer depois dos primeiros 100 caracteres (pra não cortar título)
-        if (idx !== -1 && idx < cutoffIndex && idx > 50) {
+    let cutoffIndex = text.length;
+
+    for (const marker of endMarkers) {
+        const idx = lower.indexOf(marker);
+        if (idx !== -1 && idx < cutoffIndex) {
             cutoffIndex = idx;
         }
     }
 
+    // Pega apenas o conteúdo útil (Resumo, Detalhes, Próximas Etapas)
     let cleanText = text.substring(0, cutoffIndex);
 
-    // 2. Remove linhas vazias e espaços duplos (Compactação)
+    // 2. Limpeza básica
     cleanText = cleanText.replace(/\n\s*\n/g, '\n').replace(/\s+/g, ' ').trim();
 
-    // 3. Limite de segurança para URL (GET)
-    // O limite seguro é ~2000. O prompt ocupa ~800. Sobram ~1200.
-    const MAX_CHARS = 1200;
-    
-    if (cleanText.length > MAX_CHARS) {
-        // Prioriza o final do resumo (onde costumam estar os "Próximos Passos")
-        const start = cleanText.substring(0, 600);
-        const end = cleanText.substring(cleanText.length - 600);
-        return `${start} ... [MEIO RESUMIDO] ... ${end}`;
+    // 3. Compressão para URL (GET)
+    // Se ainda for muito grande (ex: reunião de 3 horas resumida), pegamos o essencial.
+    const MAX_SAFE_CHARS = 1600; 
+
+    if (cleanText.length > MAX_SAFE_CHARS) {
+        // Estratégia: O "Ouro" está no INÍCIO (Resumo) e no FIM (Próximas Etapas) dessa seção limpa.
+        // O meio geralmente são os "Detalhes" longos.
+        const head = cleanText.substring(0, 900); // Garante o Resumo
+        const tail = cleanText.substring(cleanText.length - 700); // Garante as Próximas Etapas
+        return `${head}\n...[DETALHES INTERMEDIÁRIOS RESUMIDOS]...\n${tail}`;
     }
 
     return cleanText;
 }
 
-// --- BUSCAR TODAS AS ABAS ---
+// --- BUSCAR ABAS ---
 async function getAllTabsSorted(docId) {
     const auth = getGoogleAuth();
     const client = await auth.getClient();
@@ -226,7 +233,7 @@ app.post('/api/empresas', async (req, res) => {
 });
 
 // ======================================================
-// LÓGICA DE INTELIGÊNCIA (SAFE GET + DATA PT-BR)
+// LÓGICA DE INTELIGÊNCIA (DIRECTOR MODE + FIX 414)
 // ======================================================
 
 app.post('/api/resumir-empresa', async (req, res) => {
@@ -234,13 +241,14 @@ app.post('/api/resumir-empresa', async (req, res) => {
     const authHeader = getHeadOfficeToken();
     let debugLogs = [];
 
+    // Variáveis de escopo seguro
+    let docId = null;
+    let docUrl = null;
+
     if (!authHeader) return res.status(500).json({ error: "Token HeadOffice inválido." });
 
     try {
         // 1. LINK NO CSV
-        let docId = null;
-        let docUrl = null;
-        
         try {
             const csvResponse = await axios.get(SHEET_CSV_URL);
             const lines = csvResponse.data.split('\n');
@@ -268,49 +276,59 @@ app.post('/api/resumir-empresa', async (req, res) => {
         }
 
         // 3. ANÁLISE EM CADEIA
-        let currentMemory = "Início.";
+        let currentMemory = "Início da análise.";
         console.log(`[IA] Processando ${allTabs.length} abas.`);
 
         for (let i = 0; i < allTabs.length; i++) {
             const tab = allTabs[i];
             const isLast = i === allTabs.length - 1;
             
-            // FILTRAGEM E COMPRESSÃO (CRUCIAL PARA GET)
-            // Remove transcrição e compacta espaços
+            // --- CORTE ESTRATÉGICO ---
             const cleanContent = optimizeTextForGet(tab.content);
             
-            console.log(`[IA] Aba ${i+1}: "${tab.title}" -> ${cleanContent.length} chars (Safe)`);
+            console.log(`[IA] Aba ${i+1}: "${tab.title}". Original: ${tab.content.length} -> Limpo: ${cleanContent.length}`);
 
             let prompt = "";
             let contextForUrl = "";
 
             if (!isLast) {
-                // MODO: HISTÓRICO
-                prompt = `ATUE COMO CS. Resumo da reunião anterior (${tab.title}).
-                Atualize a memória com fatos vitais (sentimento, entregas).
-                Seja ULTRA conciso.`;
+                // ABAS PASSADAS: Acumula contexto
+                prompt = `ATUE COMO CS MANAGER.
+                REUNIÃO ANTERIOR: ${tab.title}.
                 
-                // Memória compacta para não estourar URL
-                contextForUrl = `MEMÓRIA: ${currentMemory.substring(0, 400)}\n\nTEXTO: ${cleanContent}`;
+                MEMÓRIA ATUAL: ${currentMemory}
+                
+                RESUMO DESTA REUNIÃO:
+                ${cleanContent}
+                
+                INSTRUÇÃO:
+                Atualize a memória com fatos importantes (sentimento, decisões).
+                Seja conciso (max 400 chars).`;
+                
+                // Limite seguro para o GET
+                contextForUrl = `MEMÓRIA: ${currentMemory.slice(0, 500)}`; 
 
             } else {
-                // MODO: DIRETOR DE CS (ÚLTIMA ABA)
+                // ABA FINAL (DIRETOR DE CS)
                 prompt = `ATUE COMO DIRETOR DE CS. ESTA É A ÚLTIMA REUNIÃO (${tab.title}).
                 
-                --- MISSÃO ---
-                Gere o Relatório de Inteligência.
+                --- MISSÃO FINAL ---
+                Gere o Relatório de Inteligência Estratégico.
+                
+                DADOS DE ENTRADA:
+                1. Histórico Prévio: ${currentMemory.slice(0, 600)}
+                2. TEXTO DA ÚLTIMA REUNIÃO:
+                ${cleanContent}
                 
                 REGRAS:
-                1. **Checkpoints/Próximos Passos:** Use EXCLUSIVAMENTE o "TEXTO DA REUNIÃO" abaixo. Se o texto mencionar "Felipe fará X", coloque isso.
-                2. **Sentimento/Perfil:** Use a MEMÓRIA + O TEXTO ATUAL.
+                - Use o "TEXTO DA ÚLTIMA REUNIÃO" para preencher 'checkpoints_feitos' e 'proximos_passos'.
+                - Se o texto tiver nomes reais (Barbara, Felipe, William), use-os.
                 
                 JSON ESTRITO:
                 {"resumo_executivo": "...", "perfil_cliente": "...", "estrategia_relacionamento": "...", "checkpoints_feitos": [], "proximos_passos": [], "riscos_bloqueios": "...", "sentimento_score": "0-10", "status_projeto": "Em Dia/Atrasado"}`;
-
-                contextForUrl = `MEMÓRIA: ${currentMemory.substring(0, 600)}\n\nTEXTO DA REUNIÃO (IMPORTANTE):\n${cleanContent}`;
             }
 
-            // CHAMADA GET (Safe)
+            // CHAMADA GET (Strict)
             let respostaIA = "";
             for (let retry = 0; retry < 2; retry++) {
                 try {
@@ -319,10 +337,12 @@ app.post('/api/resumir-empresa', async (req, res) => {
                             aiName: BOT_NAME,
                             aiId: BOT_ID,
                             question: prompt,
-                            context: contextForUrl 
+                            // O Contexto pode ir na URL se for pequeno, ou omitido se já estiver no prompt
+                            // Aqui o prompt da aba final JÁ CONTÉM o texto limpo, então não precisamos duplicar no param 'context'
+                            context: isLast ? "Foco na última reunião." : contextForUrl 
                         },
                         headers: { 'Authorization': authHeader },
-                        timeout: 35000
+                        timeout: 45000
                     });
                     
                     const tResp = response.data.text || response.data.answer;
@@ -333,11 +353,14 @@ app.post('/api/resumir-empresa', async (req, res) => {
                 } catch (e) { 
                     console.error(`Erro IA Aba ${i}: ${e.message}`);
                     if (e.response && e.response.status === 414) {
-                        // Retry com contexto minúsculo se der 414
                         try {
-                            const tinyContext = contextForUrl.slice(0, 500); 
+                            // Se der 414 na última, enviamos um prompt menor
+                            const fallbackPrompt = isLast 
+                                ? `Gere JSON de status CS para esta reunião: ${cleanContent.slice(0, 800)}...`
+                                : `Resuma fatos.`;
+                                
                             const r2 = await axios.get(`${BASE_URL}/openai/question`, {
-                                params: { aiName: BOT_NAME, aiId: BOT_ID, question: prompt, context: tinyContext },
+                                params: { aiName: BOT_NAME, aiId: BOT_ID, question: fallbackPrompt },
                                 headers: { 'Authorization': authHeader }
                             });
                             respostaIA = r2.data.text || r2.data.answer;
@@ -360,8 +383,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
         try {
             data = JSON.parse(jsonOnly);
         } catch (e) {
-            // Se a IA alucinar texto plano, tentamos salvar no resumo
-            data = { resumo_executivo: currentMemory.substring(0, 500) };
+            data = { resumo_executivo: "Erro ao processar JSON. Logs: " + currentMemory.substring(0, 300) };
         }
 
         const score = parseInt(data.sentimento_score) || 5;
@@ -380,7 +402,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
                 </div>
 
                 <div class="text-xs text-slate-300 leading-relaxed border-l-2 border-indigo-500 pl-3">
-                    ${data.resumo_executivo || "Sem resumo gerado."}
+                    ${data.resumo_executivo}
                 </div>
 
                 <div class="grid grid-cols-2 gap-2">
@@ -394,7 +416,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
                     <div class="bg-[#0f172a] p-2.5 rounded border border-white/5 hover:border-emerald-500/30 transition-colors">
                         <div class="flex items-center gap-2 mb-1">
                             <i data-lucide="compass" class="w-3 h-3 text-emerald-400"></i>
-                            <span class="text-[10px] font-bold text-emerald-200 uppercase tracking-wide">Estratégia</span>
+                            <span class="text-[10px] font-bold text-emerald-200 uppercase tracking-wide">Ação</span>
                         </div>
                         <p class="text-[10px] text-slate-400 leading-snug italic">"${data.estrategia_relacionamento || "-"}"</p>
                     </div>
@@ -446,7 +468,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
     } catch (error) {
         console.error(`[ERRO FATAL]:`, error.message);
-        res.status(500).json({ error: "Falha técnica", details: error.message });
+        res.status(500).json({ error: "Falha de processamento", details: error.message });
     }
 });
 
