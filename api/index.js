@@ -16,7 +16,7 @@ const supabase = createClient(
 );
 
 const BASE_URL = 'https://api.headoffice.ai/v1';
-const SHEET_FULL_URL = 'https://docs.google.com/spreadsheets/d/1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM/edit?gid=0#gid=0';
+const SHEET_CSV_URL = 'https://docs.google.com/spreadsheets/d/1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM/export?format=csv';
 
 app.get('/', (req, res) => {
     const currentUrl = `https://${req.headers.host}`;
@@ -38,62 +38,72 @@ app.post('/api/empresas', async (req, res) => {
     res.json({ success: true, data });
 });
 
-// --- ROTA DE RESUMO COM LOGS DE DEBUG ---
+// --- ROTA DE RESUMO ---
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     
-    // Tratamento de Token
-    let rawToken = process.env.HEADOFFICE_JWT || "";
+    // ======================================================
+    // 🚨 ÁREA DE EMERGÊNCIA 🚨
+    // Se a variável de ambiente falhar, cole o token aqui entre as aspas
+    const TOKEN_DE_EMERGENCIA = ""; 
+    // ======================================================
+    
+    let rawToken = TOKEN_DE_EMERGENCIA || process.env.HEADOFFICE_JWT || "";
+    
+    // Limpeza básica (remove espaços e aspas extras)
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
-
-    // LOG DE DEBUG (Aparecerá nos logs da Vercel)
-    console.log(`[DEBUG] Tentando resumir: ${nome}`);
-    console.log(`[DEBUG] Token Configurado? ${rawToken ? 'SIM' : 'NÃO'}`);
-    console.log(`[DEBUG] Início do Token: ${rawToken.substring(0, 15)}...`); 
-
-    // Monta o Header, removendo "Bearer" se existir
-    let authHeader = rawToken;
-    if (authHeader.toLowerCase().startsWith('bearer ')) {
-        authHeader = authHeader.slice(7).trim();
+    
+    // MUDANÇA: Removemos "Bearer ". O header será apenas o token.
+    // Se o token já vier com Bearer colado, removemos para garantir.
+    if (rawToken.toLowerCase().startsWith('bearer ')) {
+        rawToken = rawToken.substring(7).trim(); // Remove "Bearer " do início
     }
+    
+    const authHeader = rawToken; // Envia SOMENTE O CÓDIGO
 
-    if (!authHeader || authHeader.length < 20) {
-        return res.status(500).json({ error: "Token JWT inválido ou muito curto." });
+    // Debug
+    console.log(`[DEBUG] Token sendo enviado (primeiros 10 chars): ${authHeader.substring(0, 10)}...`);
+
+    if (rawToken.length < 10) {
+        return res.status(500).json({ error: "Token inválido/vazio." });
     }
 
     let step = "Início";
 
     try {
-        // PASSO 1: Descobrir Link
-        step = "Buscando Link na Planilha";
-        const linkResponse = await axios.get(`${BASE_URL}/openai/question`, {
-            params: {
-                aiName: 'Roger', 
-                context: `Planilha: ${SHEET_FULL_URL}`,
-                question: `Qual é a URL do documento (Link Docs) da empresa "${nome}"? Retorne APENAS a URL.`
-            },
-            headers: { 'Authorization': authHeader }
-        });
+        // PASSO 1: Buscar Link na Planilha via CSV
+        step = "Baixando CSV";
+        const csvResponse = await axios.get(SHEET_CSV_URL);
+        const csvData = csvResponse.data;
+        const lines = csvData.split('\n');
+        let docUrl = null;
 
-        const answerLink = linkResponse.data.answer || "";
-        const urlMatch = answerLink.match(/(https?:\/\/[^\s]+)/);
-        const docUrl = urlMatch ? urlMatch[0] : null;
+        for (const line of lines) {
+            if (line.toLowerCase().includes(nome.toLowerCase())) {
+                const match = line.match(/(https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+)/);
+                if (match) {
+                    docUrl = match[0];
+                    break;
+                }
+            }
+        }
 
-        if (!docUrl) return res.json({ success: false, error: `Link não encontrado na planilha para ${nome}. IA respondeu: ${answerLink}` });
+        if (!docUrl) return res.json({ success: false, error: `Link não encontrado no CSV para: ${nome}` });
 
-        // PASSO 2: Resumir
-        step = "Lendo Documento";
+        // PASSO 2: Resumir (IA)
+        step = "Chamando API HeadOffice";
+        
         const summaryResponse = await axios.get(`${BASE_URL}/openai/question`, {
             params: {
                 aiName: 'Roger',
                 context: `Documento: ${docUrl}`,
-                question: `Leia a ÚLTIMA sessão. JSON: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico", "status_projeto": "Em Dia/Atrasado"}`
+                question: `Leia a ÚLTIMA sessão. JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico", "status_projeto": "Em Dia/Atrasado"}`
             },
-            headers: { 'Authorization': authHeader }
+            headers: { 'Authorization': authHeader } // Sem Bearer, apenas token
         });
 
-        // Parse e Salvar
+        // Tratamento
         let result = {};
         const answerRaw = summaryResponse.data.answer || "";
         try {
@@ -103,6 +113,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
             result = { resumo: answerRaw.substring(0, 400), status_cliente: "Erro Leitura", status_projeto: "Erro Leitura" };
         }
 
+        // Salvar
         const updatePayload = {
             doc_link: docUrl,
             resumo: result.resumo,
@@ -116,16 +127,13 @@ app.post('/api/resumir-empresa', async (req, res) => {
         res.json({ success: true, data: updatePayload });
 
     } catch (error) {
-        console.error(`[ERRO FATAL] Passo: ${step}`);
+        console.error(`[ERRO] Passo: ${step}`, error.message);
         if (error.response) {
-            console.error(`[ERRO API] Status: ${error.response.status}`);
-            console.error(`[ERRO BODY]`, JSON.stringify(error.response.data));
-            
-            // Retorna o erro exato da HeadOffice para o frontend
+            console.error(`[ERRO RESPOSTA]`, JSON.stringify(error.response.data));
             return res.status(500).json({ 
-                error: "Erro de Token/API", 
+                error: "Erro API HeadOffice", 
                 step, 
-                details: `API respondeu ${error.response.status}: ${JSON.stringify(error.response.data)}` 
+                details: error.response.data 
             });
         }
         res.status(500).json({ error: "Erro interno", step, details: error.message });
@@ -226,7 +234,7 @@ const DASHBOARD_HTML = `
                 });
                 const json = await res.json();
                 if (json.success) { loadCompanies(); } 
-                else { alert('Erro: ' + (json.details || json.error)); btn.innerHTML = 'Erro ⚠️'; }
+                else { alert('Erro: ' + (json.details ? JSON.stringify(json.details) : json.error)); btn.innerHTML = 'Erro ⚠️'; }
             } catch (e) { alert('Erro conexão.'); btn.innerHTML = 'Falha'; } 
             finally { setTimeout(() => { btn.disabled = false; if(btn.innerHTML === 'Falha') btn.innerHTML = originalText; }, 2000); }
         }
