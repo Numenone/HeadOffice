@@ -21,7 +21,7 @@ app.get('/', (req, res) => {
     // Injeta a URL correta da API no HTML antes de enviar
     // O 'req.headers.host' pega a URL atual do site automaticamente
     const currentUrl = `https://${req.headers.host}`;
-    const htmlComUrl = DASHBOARD_HTML.replace('https://head-office-2e6tmw369-numenones-projects.vercel.app', currentUrl);
+    const htmlComUrl = DASHBOARD_HTML.replace('https://head-office-one.vercel.app', currentUrl);
     res.send(htmlComUrl);
 });
 
@@ -98,7 +98,7 @@ const DASHBOARD_HTML = `
     </style>
 </head>
 <body class="min-h-screen p-8">
-    <script>const API_URL = 'SUA_URL_DA_VERCEL_AQUI';</script>
+    <script>const API_URL = 'https://head-office-one.vercel.app';</script>
     <div class="stars" id="starsContainer"></div>
     <div class="max-w-7xl mx-auto">
         <header class="flex justify-between items-center mb-12">
