@@ -22,7 +22,6 @@ const SHEET_FULL_URL = 'https://docs.google.com/spreadsheets/d/1m6yZozLKIZ8KyT9Y
 // --- ROTA 1: DASHBOARD ---
 app.get('/', (req, res) => {
     const currentUrl = `https://${req.headers.host}`;
-    // Substitui a URL hardcoded pela URL atual do deploy
     const htmlComUrl = DASHBOARD_HTML.replace('https://head-office-one.vercel.app', currentUrl);
     res.send(htmlComUrl);
 });
@@ -43,11 +42,10 @@ app.post('/api/empresas', async (req, res) => {
     res.json({ success: true, data });
 });
 
-// --- ROTA 4: RESUMIR EMPRESA (Usando JWT) ---
+// --- ROTA 4: RESUMIR EMPRESA (Com aiName: Roger) ---
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     
-    // MUDANÇA: Agora usamos o JWT
     const HEADOFFICE_JWT = process.env.HEADOFFICE_JWT;
     
     // CHECK DE SEGURANÇA
@@ -61,12 +59,13 @@ app.post('/api/resumir-empresa', async (req, res) => {
         // --- PASSO 1: Descobrir o Link ---
         step = "Buscando Link na Planilha";
         
+        // Chamada GET com aiName='Roger'
         const linkResponse = await axios.get(`${BASE_URL}/openai/question`, {
             params: {
+                aiName: 'Roger', // Parâmetro Obrigatório adicionado
                 context: `Planilha: ${SHEET_FULL_URL}`,
                 question: `Qual é a URL do documento (Link Docs) da empresa "${nome}"? Retorne APENAS a URL, sem texto.`
             },
-            // MUDANÇA: Authorization Bearer com JWT
             headers: { 'Authorization': `Bearer ${HEADOFFICE_JWT}` }
         });
 
@@ -81,8 +80,10 @@ app.post('/api/resumir-empresa', async (req, res) => {
         // --- PASSO 2: Resumir o Documento ---
         step = "Lendo Documento Encontrado";
         
+        // Chamada GET com aiName='Roger'
         const summaryResponse = await axios.get(`${BASE_URL}/openai/question`, {
             params: {
+                aiName: 'Roger', // Parâmetro Obrigatório adicionado
                 context: `Documento: ${docUrl}`,
                 question: `Leia a ÚLTIMA sessão (data mais recente). Retorne JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico", "status_projeto": "Em Dia/Atrasado"}`
             },
