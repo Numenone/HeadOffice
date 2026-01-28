@@ -40,7 +40,7 @@ app.post('/api/empresas', async (req, res) => {
     res.json({ success: true, data });
 });
 
-// --- ROTA DE RESUMO (LEITURA DIRETA) ---
+// --- ROTA DE RESUMO (LINK TXT) ---
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     
@@ -74,11 +74,12 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
         if (!docUrl) {
             step = "Perguntando à IA (Fallback Link)";
+            // Aqui usamos GET normal, pois a pergunta é curta
             const aiSearch = await axios.get(`${BASE_URL}/openai/question`, {
                 params: {
                     aiName: 'Roger', 
                     context: `Planilha: ${SHEET_FULL_URL}`,
-                    question: `Encontre a empresa "${nome}". Extraia a URL do Google Docs (Link Docs). Retorne APENAS a URL.`
+                    question: `Encontre a empresa "${nome}". Extraia a URL do Google Docs. Retorne APENAS a URL.`
                 },
                 headers: { 'Authorization': authHeader }
             });
@@ -89,39 +90,20 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
         if (!docUrl) return res.json({ success: false, error: `Link não encontrado para ${nome}.` });
 
-        // PASSO 2: LEITURA DIRETA DO CONTEÚDO (O Pulo do Gato)
-        step = `Baixando Texto do Doc`;
+        // PASSO 2: CONVERTER LINK PARA TXT
+        // Transformamos o link visual em link de texto puro para a IA conseguir ler sem travar no HTML
         const txtUrl = `${docUrl}/export?format=txt`;
-        let docContent = "";
+        console.log(`[SUCESSO] Enviando link TXT para a IA: ${txtUrl}`);
 
-        try {
-            // O próprio backend baixa o texto agora
-            const textResponse = await axios.get(txtUrl);
-            docContent = typeof textResponse.data === 'string' ? textResponse.data : JSON.stringify(textResponse.data);
-
-            // Verificação de Segurança: Se retornou HTML, é porque pediu login
-            if (docContent.includes("<!DOCTYPE html>") || docContent.includes("Google Accounts")) {
-                return res.json({ 
-                    success: false, 
-                    error: "O Google Docs bloqueou o acesso. Verifique se o DOCUMENTO (não só a planilha) está público para 'Qualquer pessoa com o link'." 
-                });
-            }
-        } catch (downloadError) {
-            return res.json({ success: false, error: "Falha ao baixar o texto do documento. O link pode estar quebrado ou privado." });
-        }
-
-        // Limita o tamanho do texto para não estourar a memória da IA (aprox 20k caracteres)
-        const truncatedContent = docContent.substring(docContent.length - 20000); // Pega o final (últimas sessões)
-
-        // PASSO 3: Resumir (Enviando o TEXTO, não o link)
-        step = "Enviando Texto para IA";
+        // PASSO 3: RESUMIR (Enviando a URL do TXT no contexto)
+        step = "Chamando IA com Link TXT";
         
+        // Aqui enviamos 'txtUrl' no context. Como é uma URL curta, NÃO vai dar erro 414.
         const summaryResponse = await axios.get(`${BASE_URL}/openai/question`, {
             params: {
                 aiName: 'Roger',
-                // AQUI ESTÁ A MÁGICA: Enviamos o conteúdo direto
-                context: `Conteúdo da Transcrição (Final do arquivo):\n${truncatedContent}`,
-                question: `Aja como Gerente de Projetos. Analise a transcrição. Identifique a ÚLTIMA data/sessão. Resuma o status.
+                context: `Leia o conteúdo deste link de texto puro: ${txtUrl}`,
+                question: `Aja como Gerente. Leia o texto do link acima. Identifique a ÚLTIMA data registrada. Resuma. 
                 Retorne JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico/Neutro", "status_projeto": "Em Dia/Atrasado"}`
             },
             headers: { 'Authorization': authHeader }
@@ -152,7 +134,10 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
     } catch (error) {
         console.error(`[ERRO] ${step}:`, error.message);
+        
+        // Captura o erro 414 ou outros
         const errorDetail = error.response ? JSON.stringify(error.response.data) : error.message;
+        
         res.status(500).json({ error: "Falha técnica", step, details: errorDetail });
     }
 });
