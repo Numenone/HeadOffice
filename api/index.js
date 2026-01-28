@@ -24,23 +24,56 @@ const SHEET_FULL_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`
 const BOT_ID = '69372353b11d9df606b68bf8';
 const BOT_NAME = 'Roger';
 
-// --- ROTA DASHBOARD (FRONTEND PREMIUM) ---
+// --- ROTA DASHBOARD ---
 app.get('/', (req, res) => {
     const currentUrl = `https://${req.headers.host}`;
     const htmlComUrl = DASHBOARD_HTML.replace('https://head-office-one.vercel.app', currentUrl);
     res.send(htmlComUrl);
 });
 
-// --- HELPER AUTH ---
-function getAuthToken() {
+// --- HELPER AUTH (HEADOFFICE) ---
+function getHeadOfficeToken() {
     const TOKEN_DE_EMERGENCIA = ""; 
     let rawToken = TOKEN_DE_EMERGENCIA || process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
+    if (rawToken.toLowerCase().startsWith('bearer ')) rawToken = rawToken.substring(7).trim();
     return rawToken.length > 10 ? rawToken : null;
 }
 
-// --- HELPER QUEBRA DE TEXTO ---
+// --- HELPER GOOGLE DOCS API (GCP) ---
+async function getGoogleDocContent(docId) {
+    const apiKey = process.env.GOOGLE_API_KEY; // SUA CHAVE DO GCP AQUI
+    if (!apiKey) throw new Error("GOOGLE_API_KEY não configurada na Vercel.");
+
+    try {
+        const url = `https://docs.googleapis.com/v1/documents/${docId}?key=${apiKey}`;
+        const response = await axios.get(url);
+        const doc = response.data;
+        
+        // O Google devolve um JSON complexo. Precisamos extrair o texto de cada parágrafo.
+        let fullText = "";
+        if (doc.body && doc.body.content) {
+            doc.body.content.forEach(struc => {
+                if (struc.paragraph) {
+                    struc.paragraph.elements.forEach(elem => {
+                        if (elem.textRun) {
+                            fullText += elem.textRun.content;
+                        }
+                    });
+                }
+            });
+        }
+        return fullText;
+    } catch (error) {
+        if (error.response && error.response.status === 403) {
+            throw new Error("Permissão negada pelo Google. O documento precisa estar público (Leitor) ou a API Key não tem acesso.");
+        }
+        throw error;
+    }
+}
+
+// --- HELPER TEXT SPLIT ---
 function splitText(text, chunkSize) {
     const chunks = [];
     for (let i = 0; i < text.length; i += chunkSize) {
@@ -49,7 +82,7 @@ function splitText(text, chunkSize) {
     return chunks;
 }
 
-// --- HELPER EXTRAIR JSON ---
+// --- HELPER JSON PARSE ---
 function extractJSON(text) {
     if (!text) return null;
     const start = text.indexOf('{');
@@ -60,14 +93,13 @@ function extractJSON(text) {
     return text;
 }
 
-// --- ROTA LISTAR EMPRESAS ---
+// --- ROTAS CRUD EMPRESAS ---
 app.get('/api/empresas', async (req, res) => {
     const { data, error } = await supabase.from('empresas').select('*').order('nome', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
     res.json(data);
 });
 
-// --- ROTA CRIAR EMPRESA ---
 app.post('/api/empresas', async (req, res) => {
     const { nome } = req.body;
     if (!nome) return res.status(400).json({ error: "Nome obrigatório" });
@@ -77,103 +109,92 @@ app.post('/api/empresas', async (req, res) => {
 });
 
 // ======================================================
-// LÓGICA DE INTELIGÊNCIA ARTIFICIAL (CS INTELLIGENCE)
+// LÓGICA DE INTELIGÊNCIA ARTIFICIAL (CS INTELLIGENCE V2)
 // ======================================================
 
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
-    const authHeader = getAuthToken();
+    const authHeader = getHeadOfficeToken();
 
-    if (!authHeader) return res.status(500).json({ error: "Token inválido." });
+    if (!authHeader) return res.status(500).json({ error: "Token HeadOffice inválido." });
 
     let step = "Início";
     let docUrl = null;
+    let docId = null;
 
     try {
-        // 1. Encontrar Link
+        // 1. Encontrar Link no CSV
         step = "Buscando Link no CSV";
         try {
             const csvResponse = await axios.get(SHEET_CSV_URL);
             const lines = csvResponse.data.split('\n');
             for (const line of lines) {
                 if (line.toLowerCase().includes(nome.toLowerCase())) {
-                    const match = line.match(/(https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+)/);
-                    if (match) { docUrl = match[0]; break; }
+                    const match = line.match(/(https:\/\/docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+))/);
+                    if (match) { 
+                        docUrl = match[0]; 
+                        docId = match[2];
+                        break; 
+                    }
                 }
             }
         } catch (e) { console.warn("CSV falhou."); }
 
-        if (!docUrl) {
-            step = "Buscando Link via IA";
-            const aiSearch = await axios.get(`${BASE_URL}/openai/question`, {
-                params: {
-                    aiName: BOT_NAME,
-                    aiId: BOT_ID,
-                    context: `Planilha: ${SHEET_FULL_URL}`,
-                    question: `Encontre a empresa "${nome}". Extraia a URL do Docs.`
-                },
-                headers: { 'Authorization': authHeader }
-            });
-            const answerAI = aiSearch.data.text || aiSearch.data.answer || "";
-            const matchAI = answerAI.match(/(https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+)/);
-            if (matchAI) docUrl = matchAI[0];
-        }
+        if (!docUrl) return res.json({ success: false, error: `Link não encontrado na planilha para ${nome}.` });
 
-        if (!docUrl) return res.json({ success: false, error: `Link não encontrado para ${nome}.` });
-
-        // 2. Baixar Texto
-        step = `Baixando Texto`;
-        const txtUrl = `${docUrl}/export?format=txt`;
+        // 2. Extração via GCP (INFALÍVEL SE TIVER PERMISSÃO)
+        step = `Lendo Google Docs (API Oficial)`;
         let fullText = "";
+        
         try {
-            const textResponse = await axios.get(txtUrl);
-            fullText = typeof textResponse.data === 'string' ? textResponse.data : JSON.stringify(textResponse.data);
+            fullText = await getGoogleDocContent(docId);
             
-            if (!fullText || fullText.length < 50) return res.json({ success: false, error: "Doc vazio ou muito curto." });
-            if (fullText.includes("<!DOCTYPE html>") || fullText.includes("Google Accounts")) {
-                return res.json({ success: false, error: "Doc privado. Libere o acesso." });
+            // Validação Anti-Alucinação
+            if (!fullText || fullText.trim().length < 20) {
+                return res.json({ success: false, error: "O documento está vazio. A IA não tem o que ler." });
             }
-        } catch (downloadError) {
-            return res.json({ success: false, error: "Falha ao baixar Doc (404/403)." });
+        } catch (apiError) {
+            console.error("Erro GCP:", apiError.message);
+            return res.json({ 
+                success: false, 
+                error: `Erro ao ler Doc via Google API: ${apiError.message}. Verifique se o doc é público e se a API Key está válida.` 
+            });
         }
 
-        // 3. ANÁLISE EM CADEIA (CHAIN)
-        step = "Análise Contínua";
-        const relevantText = fullText.slice(-15000); 
-        const chunks = splitText(relevantText, 2500); 
-        console.log(`[CHAIN] ${chunks.length} partes.`);
+        // 3. ANÁLISE PROFUNDA (CHAIN)
+        step = "Processamento Neural CS";
+        
+        // Pega os últimos 20.000 caracteres para ter muito contexto
+        const relevantText = fullText.slice(-20000); 
+        const chunks = splitText(relevantText, 3000); // 3k chars por chunk
+        console.log(`[CHAIN] Processando ${chunks.length} blocos de texto real.`);
 
         let currentMemory = "";
 
         for (let i = 0; i < chunks.length; i++) {
             const chunk = chunks[i];
             const isLast = i === chunks.length - 1;
-            const safeMemory = currentMemory.length > 1200 ? currentMemory.substring(0, 1200) + "..." : currentMemory;
+            const safeMemory = currentMemory.length > 1500 ? currentMemory.substring(0, 1500) + "..." : currentMemory;
 
-            // --- O PROMPT DE OURO ---
-            // Esse prompt força a IA a agir como um estrategista de CS.
+            // --- PROMPT CS SÊNIOR (ANTI-ALUCINAÇÃO) ---
             const prompt = isLast 
-                ? `VOCÊ É UM DIRETOR DE CUSTOMER SUCCESS SÊNIOR.
-                   Com base em todo o histórico, gere um relatório final de inteligência.
-                   Seja crítico, analítico e extremamente detalhado. NÃO use frases genéricas.
+                ? `ATUE COMO UM SÊNIOR CUSTOMER SUCCESS MANAGER.
+                   Analise o texto real fornecido abaixo (transcrição de reunião/doc).
                    
-                   Analise:
-                   1. **Raio-X do Cliente:** Como ele fala? É técnico ou leigo? Ansioso ou calmo? Como devemos falar com ele?
-                   2. **Status Real:** Onde estamos no cronograma? O que está travado?
-                   3. **Checkpoints:** O que já foi entregue e o que falta (com datas se houver).
-                   
-                   Gere este JSON estrito (sem markdown):
+                   🚨 REGRA CRÍTICA: Se o texto não contiver informações suficientes, escreva "Não informado no texto" no campo correspondente. NUNCA INVENTE DADOS ("A conta X", "01/01/2022"). USE APENAS FATOS DO TEXTO.
+
+                   Gere um Relatório de Inteligência JSON estrito:
                    {
-                      "resumo_executivo": "Resumo de alto nível do estado do projeto e da saúde da conta.",
-                      "perfil_cliente": "Análise psicológica: Estilo de comunicação, nível de exigência, o que irrita ele, o que deixa ele feliz.",
-                      "dica_cs": "Dica prática para o time: Ex: 'Seja direto, não dê desculpas' ou 'Elogie a visão dele'.",
-                      "checkpoints_feitos": ["Item 1", "Item 2"],
-                      "proximos_passos": ["Ação imediata 1", "Ação 2"],
-                      "pontos_atencao": "Riscos, bloqueios ou reclamações recentes.",
-                      "status_geral": "Satisfeito/Crítico/Neutro",
-                      "status_cronograma": "Em Dia/Atrasado/Risco"
+                      "resumo_executivo": "Onde estamos HOJE? Qual o foco da semana? Use nomes reais citados.",
+                      "perfil_cliente": "Psicologia do cliente: Ele é detalhista? Apressado? Visionário? Como ele reage a problemas?",
+                      "estrategia_relacionamento": "Como o CS deve agir? (Ex: 'Seja proativo no WhatsApp', 'Formalize tudo por email').",
+                      "checkpoints_concluidos": ["Lista do que FOI FEITO recentemente"],
+                      "proximos_passos": ["Lista do que SERÁ FEITO e QUEM fará"],
+                      "riscos_bloqueios": "O que está impedindo o sucesso? Alguma reclamação?",
+                      "sentimento_score": "Número de 0 a 10 (0=Furioso, 10=Fã)",
+                      "status_projeto": "Em Dia/Atrasado/Pausado"
                    }`
-                : `Leia este trecho. Identifique: Novas entregas, novas reclamações, mudanças de tom. Atualize seu entendimento do projeto.`;
+                : `Analise este trecho da transcrição. Extraia fatos, datas e sentimentos. Ignore conversas fiadas ("bom dia"). Acumule inteligência para o relatório final.`;
 
             let respostaIA = "";
             for (let retry = 0; retry < 2; retry++) {
@@ -182,7 +203,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
                         params: {
                             aiName: BOT_NAME,
                             aiId: BOT_ID,
-                            context: `MEMÓRIA ESTRATÉGICA: ${safeMemory || "Nenhuma"}\n\nNOVA INTERAÇÃO:\n${chunk}`,
+                            context: `CONTEXTO ACUMULADO: ${safeMemory || "Início da leitura"}\n\nTEXTO ORIGINAL DO DOC:\n${chunk}`,
                             question: prompt
                         },
                         headers: { 'Authorization': authHeader }
@@ -193,17 +214,15 @@ app.post('/api/resumir-empresa', async (req, res) => {
                         respostaIA = textoResposta;
                         break; 
                     }
-                } catch (e) { console.error("Erro na chamada IA:", e.message); }
+                } catch (e) { console.error("Erro IA:", e.message); }
             }
 
-            if (respostaIA) {
-                currentMemory = respostaIA;
-            }
+            if (respostaIA) currentMemory = respostaIA;
         }
 
-        // 4. PROCESSAMENTO E FORMATAÇÃO VISUAL (HTML-IN-DB STRATEGY)
-        step = "Formatando Relatório";
-        if (!currentMemory) return res.json({ success: false, error: `IA muda.` });
+        // 4. RENDERIZAÇÃO VISUAL (FRONTEND INSIDE BACKEND)
+        step = "Gerando Visualização";
+        if (!currentMemory) return res.json({ success: false, error: `IA não retornou análise.` });
 
         const jsonOnly = extractJSON(currentMemory);
         let data = {};
@@ -211,56 +230,77 @@ app.post('/api/resumir-empresa', async (req, res) => {
         try {
             data = JSON.parse(jsonOnly);
         } catch (e) {
-            data = { resumo_executivo: currentMemory.substring(0, 500) }; // Fallback
+            data = { resumo_executivo: "Erro ao estruturar dados: " + currentMemory.substring(0, 200) };
         }
 
-        // --- CONSTRUÇÃO DO HTML RICO PARA SALVAR NO BANCO ---
-        // Salvamos HTML direto no campo 'resumo' para o frontend apenas renderizar.
-        // Isso permite layouts complexos sem mudar o banco de dados.
-        
+        // Definição de Cores baseada no Score
+        const score = parseInt(data.sentimento_score) || 5;
+        let scoreColor = "text-yellow-400 border-yellow-500/30 bg-yellow-500/10";
+        if (score >= 8) scoreColor = "text-emerald-400 border-emerald-500/30 bg-emerald-500/10";
+        if (score <= 4) scoreColor = "text-red-400 border-red-500/30 bg-red-500/10";
+
         const htmlResumo = `
-            <div class="space-y-3">
-                <p class="text-sm text-slate-300 leading-relaxed">${data.resumo_executivo || "Sem resumo."}</p>
-                
-                <div class="grid grid-cols-2 gap-2 mt-2">
-                    <div class="bg-indigo-500/10 p-2 rounded border border-indigo-500/20">
-                        <h4 class="text-[10px] uppercase font-bold text-indigo-400 mb-1">Perfil & Tom</h4>
-                        <p class="text-[11px] text-slate-300">${data.perfil_cliente || "N/A"}</p>
+            <div class="space-y-4 font-sans">
+                <div class="text-xs text-slate-300 leading-relaxed border-l-2 border-indigo-500 pl-3">
+                    ${data.resumo_executivo}
+                </div>
+
+                <div class="grid grid-cols-2 gap-2">
+                    <div class="bg-[#0f172a] p-2.5 rounded border border-white/5 hover:border-indigo-500/30 transition-colors">
+                        <div class="flex items-center gap-2 mb-1">
+                            <i data-lucide="brain" class="w-3 h-3 text-purple-400"></i>
+                            <span class="text-[10px] font-bold text-purple-200 uppercase tracking-wide">Perfil</span>
+                        </div>
+                        <p class="text-[10px] text-slate-400 leading-snug">${data.perfil_cliente || "-"}</p>
                     </div>
-                    <div class="bg-emerald-500/10 p-2 rounded border border-emerald-500/20">
-                        <h4 class="text-[10px] uppercase font-bold text-emerald-400 mb-1">Dica de Ouro CS</h4>
-                        <p class="text-[11px] text-slate-300 italic">"${data.dica_cs || "Sem dicas"}"</p>
+                    <div class="bg-[#0f172a] p-2.5 rounded border border-white/5 hover:border-emerald-500/30 transition-colors">
+                        <div class="flex items-center gap-2 mb-1">
+                            <i data-lucide="message-square" class="w-3 h-3 text-emerald-400"></i>
+                            <span class="text-[10px] font-bold text-emerald-200 uppercase tracking-wide">Estratégia</span>
+                        </div>
+                        <p class="text-[10px] text-slate-400 leading-snug italic">"${data.estrategia_relacionamento || "-"}"</p>
                     </div>
                 </div>
 
-                ${data.pontos_atencao ? `
-                <div class="bg-red-500/10 p-2 rounded border border-red-500/20 flex items-start gap-2">
-                    <span class="text-red-400">⚠️</span>
-                    <div>
-                        <h4 class="text-[10px] uppercase font-bold text-red-400">Atenção Crítica</h4>
-                        <p class="text-[11px] text-slate-300">${data.pontos_atencao}</p>
-                    </div>
-                </div>` : ''}
+                <div class="grid grid-cols-1 gap-2">
+                    ${(data.checkpoints_feitos && data.checkpoints_feitos.length > 0) ? `
+                    <div class="bg-white/[0.02] p-2 rounded border border-white/5">
+                        <h4 class="text-[10px] font-bold text-slate-500 uppercase mb-2 flex items-center gap-1"><i data-lucide="check-circle-2" class="w-3 h-3"></i> Concluído</h4>
+                        <ul class="space-y-1">
+                            ${data.checkpoints_feitos.map(i => `<li class="text-[10px] text-slate-400 flex items-start gap-2"><span class="w-1 h-1 bg-green-500/50 rounded-full mt-1.5"></span><span class="flex-1">${i}</span></li>`).join('')}
+                        </ul>
+                    </div>` : ''}
+                    
+                    ${(data.proximos_passos && data.proximos_passos.length > 0) ? `
+                    <div class="bg-indigo-500/[0.05] p-2 rounded border border-indigo-500/20">
+                        <h4 class="text-[10px] font-bold text-indigo-400 uppercase mb-2 flex items-center gap-1"><i data-lucide="arrow-right-circle" class="w-3 h-3"></i> Próximos Passos</h4>
+                        <ul class="space-y-1">
+                            ${data.proximos_passos.map(i => `<li class="text-[10px] text-indigo-200 flex items-start gap-2"><span class="w-1 h-1 bg-indigo-400 rounded-full mt-1.5"></span><span class="flex-1">${i}</span></li>`).join('')}
+                        </ul>
+                    </div>` : ''}
+                </div>
 
-                <div class="mt-2">
-                    <h4 class="text-[10px] uppercase font-bold text-slate-500 mb-1 flex items-center gap-1">
-                        ✅ Checkpoints
-                    </h4>
-                    <ul class="text-[11px] text-slate-400 space-y-1 pl-1">
-                        ${(data.checkpoints_feitos || []).map(i => `<li class="flex items-center gap-2"><span class="w-1 h-1 bg-green-500 rounded-full"></span> ${i}</li>`).join('')}
-                        ${(data.proximos_passos || []).map(i => `<li class="flex items-center gap-2"><span class="w-1 h-1 bg-slate-500 rounded-full"></span> ${i}</li>`).join('')}
-                    </ul>
+                <div class="flex gap-2 items-stretch">
+                    <div class="flex-1 ${data.riscos_bloqueios ? 'bg-red-500/10 border-red-500/20' : 'bg-slate-800/50 border-white/5'} border p-2 rounded flex flex-col justify-center">
+                        <span class="text-[9px] uppercase font-bold ${data.riscos_bloqueios ? 'text-red-400' : 'text-slate-500'} block mb-1">Pontos de Atenção</span>
+                        <p class="text-[10px] ${data.riscos_bloqueios ? 'text-red-200' : 'text-slate-500'} leading-tight">${data.riscos_bloqueios || "Nenhum risco crítico detectado."}</p>
+                    </div>
+                    <div class="w-16 flex flex-col items-center justify-center p-1 rounded border ${scoreColor}">
+                        <span class="text-[8px] uppercase font-bold opacity-70">Score</span>
+                        <span class="text-xl font-bold">${score}</span>
+                        <span class="text-[8px] opacity-70">/10</span>
+                    </div>
                 </div>
             </div>
         `;
 
-        // Salva no banco
+        // Salvar
         const updatePayload = {
             doc_link: docUrl,
-            resumo: htmlResumo, // Salvamos o HTML pronto aqui!
-            pontos_importantes: "Visualizar no card", // Campo legado
-            status_cliente: data.status_geral || "Neutro",
-            status_projeto: data.status_cronograma || "Em Análise",
+            resumo: htmlResumo,
+            pontos_importantes: "Ver card",
+            status_cliente: score >= 7 ? "Satisfeito" : (score <= 4 ? "Crítico" : "Neutro"),
+            status_projeto: data.status_projeto || "Em Análise",
             last_updated: new Date()
         };
 
@@ -268,14 +308,14 @@ app.post('/api/resumir-empresa', async (req, res) => {
         res.json({ success: true, data: updatePayload });
 
     } catch (error) {
-        console.error(`[ERRO FATAL] ${step}:`, error.message);
-        res.status(500).json({ error: "Erro Interno", step, details: error.message });
+        console.error(`[ERRO CRÍTICO] ${step}:`, error.message);
+        res.status(500).json({ error: "Falha de processamento", step, details: error.message });
     }
 });
 
 app.get('/api/debug-bot', async (req, res) => {
     try {
-        const rawToken = getAuthToken();
+        const rawToken = getHeadOfficeToken();
         const response = await axios.get(`${BASE_URL}/openai/question`, {
             params: { aiName: BOT_NAME, aiId: BOT_ID, question: "Olá" },
             headers: { 'Authorization': rawToken }
@@ -286,7 +326,7 @@ app.get('/api/debug-bot', async (req, res) => {
 
 module.exports = app;
 
-// --- FRONTEND PREMIUM (CYBERPUNK GLASS) ---
+// --- FRONTEND PREMIUM (CYBERPUNK GLASS v3) ---
 const DASHBOARD_HTML = `
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -296,78 +336,68 @@ const DASHBOARD_HTML = `
     <title>CS Intelligence Hub</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@300;400;600;700;900&display=swap" rel="stylesheet">
     <style>
-        body { font-family: 'Inter', sans-serif; background-color: #030712; color: #E2E8F0; overflow-x: hidden; }
-        .mono { font-family: 'JetBrains Mono', monospace; }
+        body { font-family: 'Inter', sans-serif; background-color: #020617; color: #f8fafc; overflow-x: hidden; }
         
-        /* Glassmorphism Premium */
-        .glass-panel { 
-            background: rgba(17, 24, 39, 0.6); 
-            backdrop-filter: blur(20px); 
-            -webkit-backdrop-filter: blur(20px);
-            border: 1px solid rgba(255, 255, 255, 0.08);
-            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5);
-        }
-        
+        /* Premium Card */
         .glass-card {
-            background: linear-gradient(145deg, rgba(30, 41, 59, 0.4) 0%, rgba(15, 23, 42, 0.6) 100%);
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255, 255, 255, 0.05);
-            transition: all 0.3s ease;
+            background: rgba(15, 23, 42, 0.6);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
         }
         .glass-card:hover {
-            border-color: rgba(99, 102, 241, 0.5);
-            transform: translateY(-2px);
-            box-shadow: 0 10px 40px -10px rgba(99, 102, 241, 0.2);
+            border-color: rgba(99, 102, 241, 0.4);
+            transform: translateY(-4px);
+            box-shadow: 0 20px 40px -10px rgba(99, 102, 241, 0.15);
+            background: rgba(30, 41, 59, 0.7);
         }
 
-        /* Status Badges */
-        .badge { padding: 4px 8px; border-radius: 4px; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid; }
-        .st-Satisfeito, .st-EmDia { background: rgba(16, 185, 129, 0.1); color: #34d399; border-color: rgba(16, 185, 129, 0.2); }
-        .st-Crítico, .st-Atrasado, .st-Risco { background: rgba(239, 68, 68, 0.1); color: #f87171; border-color: rgba(239, 68, 68, 0.2); }
-        .st-Neutro, .st-EmAnálise { background: rgba(148, 163, 184, 0.1); color: #cbd5e1; border-color: rgba(148, 163, 184, 0.2); }
+        /* Status Pills */
+        .badge { padding: 4px 10px; border-radius: 99px; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid; box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
+        .st-Satisfeito, .st-EmDia { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
+        .st-Crítico, .st-Atrasado, .st-Risco { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border-color: rgba(239, 68, 68, 0.3); }
+        .st-Neutro, .st-EmAnálise { background: rgba(148, 163, 184, 0.15); color: #e2e8f0; border-color: rgba(148, 163, 184, 0.3); }
 
-        /* Animations */
-        @keyframes pulse-glow { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
-        .animate-glow { animation: pulse-glow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
-        
-        /* Background Grid */
+        /* Grid Background */
         .bg-grid {
-            background-size: 40px 40px;
-            background-image: linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
-                              linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+            background-image: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px);
+            background-size: 30px 30px;
         }
     </style>
 </head>
 <body class="min-h-screen bg-grid">
     <script>const API_URL = 'https://head-office-one.vercel.app';</script>
     
-    <div class="fixed top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 z-50"></div>
+    <div class="fixed top-0 w-full h-[2px] bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 z-50 shadow-[0_0_20px_rgba(99,102,241,0.5)]"></div>
 
-    <div class="max-w-[1600px] mx-auto p-6 md:p-12">
-        <header class="flex flex-col md:flex-row justify-between items-end mb-12 gap-6 relative">
-            <div>
-                <div class="flex items-center gap-3 mb-2">
-                    <div class="w-2 h-8 bg-indigo-500 rounded-sm"></div>
-                    <h1 class="text-4xl font-extrabold text-white tracking-tight">CS INTELLIGENCE HUB</h1>
+    <div class="max-w-[1800px] mx-auto p-6 md:p-10">
+        <header class="flex flex-col md:flex-row justify-between items-center mb-10 gap-6">
+            <div class="flex items-center gap-4">
+                <div class="bg-indigo-600 p-2.5 rounded-lg shadow-lg shadow-indigo-500/30">
+                    <i data-lucide="layout-dashboard" class="w-6 h-6 text-white"></i>
                 </div>
-                <p class="text-slate-400 font-mono text-sm pl-5">Monitoring & Semantic Analysis System v2.0</p>
+                <div>
+                    <h1 class="text-2xl font-black text-white tracking-tight">CS COMMAND CENTER</h1>
+                    <p class="text-slate-400 text-xs font-medium tracking-wide">REAL-TIME INTELLIGENCE FEED</p>
+                </div>
             </div>
             
             <div class="flex items-center gap-3 w-full md:w-auto">
-                <div class="relative group w-full md:w-64">
-                    <input type="text" id="newCompanyInput" placeholder="Adicionar cliente..." 
-                        class="w-full bg-slate-900/50 border border-slate-700 text-slate-200 text-sm rounded-lg focus:ring-indigo-500 focus:border-indigo-500 block w-full p-2.5 pl-10 placeholder-slate-600 transition-all focus:bg-slate-900">
-                    <i data-lucide="search" class="absolute left-3 top-3 w-4 h-4 text-slate-500"></i>
+                <div class="relative group">
+                    <input type="text" id="newCompanyInput" placeholder="Nova Empresa..." 
+                        class="w-64 bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 block p-2.5 pl-10 transition-all">
+                    <i data-lucide="plus-circle" class="absolute left-3 top-3 w-4 h-4 text-slate-500"></i>
                 </div>
-                <button onclick="addCompany()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-5 py-2.5 rounded-lg text-sm font-bold transition-all flex items-center gap-2 shadow-lg shadow-indigo-500/20">
-                    <i data-lucide="plus" class="w-4 h-4"></i> <span class="hidden md:inline">NOVO</span>
+                <button onclick="addCompany()" class="bg-white hover:bg-slate-200 text-slate-900 px-5 py-2.5 rounded-lg text-sm font-bold transition-all shadow-lg hover:shadow-xl flex items-center gap-2">
+                    Adicionar
                 </button>
             </div>
         </header>
 
-        <div id="grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-6">
+        <div id="grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-6 pb-20">
             </div>
     </div>
 
@@ -376,7 +406,7 @@ const DASHBOARD_HTML = `
 
         async function loadCompanies() {
             const grid = document.getElementById('grid');
-            grid.innerHTML = '<div class="col-span-full flex flex-col items-center justify-center py-20 opacity-50"><i data-lucide="loader" class="animate-spin w-8 h-8 text-indigo-500 mb-4"></i><p class="font-mono text-sm">Synchronizing Intelligence...</p></div>';
+            grid.innerHTML = '<div class="col-span-full flex flex-col items-center justify-center py-32 opacity-60"><i data-lucide="loader" class="animate-spin w-10 h-10 text-indigo-500 mb-4"></i><p class="text-sm font-mono text-indigo-300">ESTABLISHING UPLINK...</p></div>';
             lucide.createIcons();
 
             try {
@@ -385,7 +415,7 @@ const DASHBOARD_HTML = `
                 grid.innerHTML = '';
                 
                 if(data.length === 0) { 
-                    grid.innerHTML = '<div class="col-span-full text-center text-slate-600 font-mono py-20">No active signals found.</div>'; 
+                    grid.innerHTML = '<div class="col-span-full text-center text-slate-600 py-32 font-mono">NO ACTIVE CLIENTS.</div>'; 
                     return; 
                 }
 
@@ -393,43 +423,45 @@ const DASHBOARD_HTML = `
                     const sCli = (emp.status_cliente || 'Neutro').replace(/\\s/g, '');
                     const sProj = (emp.status_projeto || 'EmAnálise').replace(/\\s/g, '');
                     
-                    // Renderiza o HTML rico que veio do backend ou um placeholder
                     const contentHtml = emp.resumo && emp.resumo.includes('<div') 
                         ? emp.resumo 
-                        : \`<p class="text-sm text-slate-400 italic py-4 text-center">Aguardando primeira análise de inteligência...</p>\`;
+                        : \`<div class="flex flex-col items-center justify-center h-40 text-slate-500 gap-2"><i data-lucide="ghost" class="w-6 h-6 opacity-30"></i><p class="text-xs">Sem inteligência gerada.</p></div>\`;
 
                     grid.innerHTML += \`
-                    <div class="glass-card rounded-xl p-0 flex flex-col h-full group relative overflow-hidden">
-                        <div class="p-5 border-b border-white/5 bg-white/[0.02]">
+                    <div class="glass-card rounded-2xl flex flex-col h-full relative group">
+                        <div class="p-5 pb-3 border-b border-white/5">
                             <div class="flex justify-between items-start mb-3">
-                                <h2 class="font-bold text-white text-xl tracking-tight truncate w-10/12" title="\${emp.nome}">\${emp.nome}</h2>
-                                \${emp.doc_link ? \`<a href="\${emp.doc_link}" target="_blank" class="text-slate-500 hover:text-indigo-400 transition-colors"><i data-lucide="file-text" class="w-4 h-4"></i></a>\` : ''}
+                                <h2 class="font-bold text-white text-lg tracking-tight truncate w-10/12 group-hover:text-indigo-300 transition-colors" title="\${emp.nome}">\${emp.nome}</h2>
+                                \${emp.doc_link ? \`<a href="\${emp.doc_link}" target="_blank" class="text-slate-600 hover:text-white transition-colors p-1 hover:bg-white/10 rounded"><i data-lucide="file-text" class="w-4 h-4"></i></a>\` : ''}
                             </div>
-                            <div class="flex flex-wrap gap-2">
+                            <div class="flex gap-2">
                                 <span class="badge st-\${sCli}">\${emp.status_cliente || 'PENDENTE'}</span>
                                 <span class="badge st-\${sProj}">\${emp.status_projeto || '...'}</span>
                             </div>
                         </div>
 
-                        <div class="p-5 flex-grow">
+                        <div class="p-5 flex-grow text-sm">
                             \${contentHtml}
                         </div>
 
-                        <div class="p-4 mt-auto border-t border-white/5 bg-black/20">
+                        <div class="p-4 mt-auto border-t border-white/5 bg-slate-900/30 rounded-b-2xl">
                             <button onclick="summarize('\${emp.nome}', \${emp.id})" id="btn-\${emp.id}" 
-                                class="w-full group-hover:bg-indigo-600 bg-slate-800 hover:bg-indigo-500 text-slate-300 group-hover:text-white py-3 rounded-lg text-xs font-bold font-mono transition-all flex justify-center items-center gap-2 border border-white/5 group-hover:border-indigo-500/50 group-hover:shadow-[0_0_20px_rgba(99,102,241,0.3)]">
-                                <i data-lucide="refresh-cw" class="w-3 h-3"></i> \${emp.resumo ? 'ATUALIZAR INTELIGÊNCIA' : 'GERAR ANÁLISE'}
+                                class="w-full bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5 group-hover:border-indigo-500/30">
+                                <i data-lucide="zap" class="w-3 h-3"></i> 
+                                \${emp.resumo ? 'REPROCESSAR DADOS' : 'INICIAR ANÁLISE'}
                             </button>
-                            <div class="text-[9px] text-center text-slate-600 mt-2 font-mono">
-                                Última att: \${emp.last_updated ? new Date(emp.last_updated).toLocaleDateString() + ' ' + new Date(emp.last_updated).toLocaleTimeString().slice(0,5) : 'Nunca'}
+                            <div class="flex justify-between items-center mt-3 px-1">
+                                <span class="text-[9px] text-slate-600 uppercase font-bold tracking-wider">Last Sync</span>
+                                <span class="text-[9px] text-slate-500 font-mono">
+                                    \${emp.last_updated ? new Date(emp.last_updated).toLocaleDateString() : '--/--'}
+                                </span>
                             </div>
                         </div>
                     </div>\`;
                 });
                 lucide.createIcons();
             } catch (e) { 
-                console.error(e);
-                grid.innerHTML = '<div class="col-span-full text-center text-red-400 font-mono">System Malfunction: Unable to fetch data.</div>'; 
+                grid.innerHTML = '<div class="col-span-full text-center text-red-400 font-mono py-20">SYSTEM FAILURE: API UNREACHABLE.</div>'; 
             }
         }
 
@@ -438,8 +470,8 @@ const DASHBOARD_HTML = `
             const originalHTML = btn.innerHTML;
             
             btn.disabled = true; 
-            btn.className = "w-full bg-indigo-900/50 text-indigo-300 py-3 rounded-lg text-xs font-bold font-mono flex justify-center items-center gap-2 cursor-wait border border-indigo-500/20";
-            btn.innerHTML = '<i data-lucide="loader-2" class="animate-spin w-3 h-3"></i> PROCESSANDO DADOS...';
+            btn.className = "w-full bg-indigo-600/20 text-indigo-300 py-2.5 rounded-lg text-xs font-bold flex justify-center items-center gap-2 cursor-wait border border-indigo-500/30 animate-pulse";
+            btn.innerHTML = '<i data-lucide="loader-2" class="animate-spin w-3 h-3"></i> EXTRAINDO INTELIGÊNCIA...';
             lucide.createIcons();
 
             try {
@@ -451,23 +483,24 @@ const DASHBOARD_HTML = `
                 const json = await res.json();
                 
                 if (json.success) { 
-                    loadCompanies(); // Recarrega para mostrar o novo HTML
+                    loadCompanies(); 
                 } else { 
                     alert('Erro: ' + (json.details || json.error)); 
-                    btn.innerHTML = 'ERRO NA ANÁLISE';
-                    btn.className += " bg-red-900/50 text-red-200 border-red-500/50";
+                    btn.innerHTML = 'FALHA NA EXTRAÇÃO';
+                    btn.className = "w-full bg-red-900/20 text-red-400 border border-red-500/30 py-2.5 rounded-lg text-xs font-bold";
                 }
             } catch (e) { 
-                alert('Erro de conexão.'); 
-                btn.innerHTML = 'FALHA DE REDE';
+                btn.innerHTML = 'ERRO DE CONEXÃO';
             } finally { 
-                if(!btn.innerHTML.includes('ERRO')) {
+                if(!btn.innerHTML.includes('FALHA') && !btn.innerHTML.includes('ERRO')) {
+                    // Se deu certo, o loadCompanies vai sobrescrever o botão, então não precisamos resetar
+                } else {
                     setTimeout(() => { 
                         btn.disabled = false; 
                         btn.innerHTML = originalHTML; 
-                        btn.className = "w-full group-hover:bg-indigo-600 bg-slate-800 hover:bg-indigo-500 text-slate-300 group-hover:text-white py-3 rounded-lg text-xs font-bold font-mono transition-all flex justify-center items-center gap-2 border border-white/5 group-hover:border-indigo-500/50 group-hover:shadow-[0_0_20px_rgba(99,102,241,0.3)]";
+                        btn.className = "w-full bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5";
                         lucide.createIcons();
-                    }, 2000); 
+                    }, 3000);
                 }
             }
         }
@@ -483,7 +516,6 @@ const DASHBOARD_HTML = `
             } catch(e) {}
         }
 
-        // Auto load
         loadCompanies();
     </script>
 </body>
