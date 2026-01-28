@@ -15,7 +15,6 @@ const supabase = createClient(
     process.env.SUPABASE_KEY || ''
 );
 
-// URL Base
 const BASE_URL = 'https://api.headoffice.ai/v1';
 const SHEET_FULL_URL = 'https://docs.google.com/spreadsheets/d/1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM/edit?gid=0#gid=0';
 
@@ -42,15 +41,31 @@ app.post('/api/empresas', async (req, res) => {
     res.json({ success: true, data });
 });
 
-// --- ROTA 4: RESUMIR EMPRESA (Com aiName: Roger) ---
+// --- ROTA 4: RESUMIR EMPRESA ---
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     
-    const HEADOFFICE_JWT = process.env.HEADOFFICE_JWT;
+    // --- TRATAMENTO DE TOKEN (A PARTE IMPORTANTE) ---
+    let rawToken = process.env.HEADOFFICE_JWT || "";
     
+    // 1. Remove espaços extras no começo e fim
+    rawToken = rawToken.trim();
+    
+    // 2. Remove aspas se o usuário tiver colocado (ex: "eyJ...")
+    if (rawToken.startsWith('"') && rawToken.endsWith('"')) {
+        rawToken = rawToken.slice(1, -1);
+    }
+
+    // 3. Garante que o header Authorization esteja correto (evita "Bearer Bearer")
+    // Se o usuário já colou "Bearer eyJ...", usamos como está. Se colou só "eyJ...", adicionamos o Bearer.
+    const authHeader = rawToken.toLowerCase().startsWith('bearer ') 
+        ? rawToken 
+        : `Bearer ${rawToken}`;
+
     // CHECK DE SEGURANÇA
-    if (!HEADOFFICE_JWT) {
-        return res.status(500).json({ error: "HEADOFFICE_JWT não configurado na Vercel." });
+    if (!rawToken || rawToken.length < 20) {
+        console.error("Token parece inválido ou curto demais:", rawToken);
+        return res.status(500).json({ error: "HEADOFFICE_JWT inválido ou não configurado na Vercel." });
     }
 
     let step = "Início";
@@ -59,14 +74,13 @@ app.post('/api/resumir-empresa', async (req, res) => {
         // --- PASSO 1: Descobrir o Link ---
         step = "Buscando Link na Planilha";
         
-        // Chamada GET com aiName='Roger'
         const linkResponse = await axios.get(`${BASE_URL}/openai/question`, {
             params: {
-                aiName: 'Roger', // Parâmetro Obrigatório adicionado
+                aiName: 'Roger', 
                 context: `Planilha: ${SHEET_FULL_URL}`,
                 question: `Qual é a URL do documento (Link Docs) da empresa "${nome}"? Retorne APENAS a URL, sem texto.`
             },
-            headers: { 'Authorization': `Bearer ${HEADOFFICE_JWT}` }
+            headers: { 'Authorization': authHeader } // Usa o header tratado
         });
 
         const answerLink = linkResponse.data.answer || "";
@@ -80,14 +94,13 @@ app.post('/api/resumir-empresa', async (req, res) => {
         // --- PASSO 2: Resumir o Documento ---
         step = "Lendo Documento Encontrado";
         
-        // Chamada GET com aiName='Roger'
         const summaryResponse = await axios.get(`${BASE_URL}/openai/question`, {
             params: {
-                aiName: 'Roger', // Parâmetro Obrigatório adicionado
+                aiName: 'Roger',
                 context: `Documento: ${docUrl}`,
                 question: `Leia a ÚLTIMA sessão (data mais recente). Retorne JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico", "status_projeto": "Em Dia/Atrasado"}`
             },
-            headers: { 'Authorization': `Bearer ${HEADOFFICE_JWT}` }
+            headers: { 'Authorization': authHeader }
         });
 
         // --- TRATAMENTO ---
@@ -132,7 +145,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
 module.exports = app;
 
-// --- FRONTEND (Dashboard) ---
+// --- FRONTEND ---
 const DASHBOARD_HTML = `
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -155,9 +168,7 @@ const DASHBOARD_HTML = `
 </head>
 <body class="min-h-screen p-6 md:p-12">
     <script>const API_URL = 'https://head-office-one.vercel.app';</script>
-    
     <div class="stars" id="starsContainer"></div>
-    
     <div class="max-w-7xl mx-auto">
         <header class="flex flex-col md:flex-row justify-between items-center mb-8 gap-4">
             <div>
