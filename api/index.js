@@ -30,11 +30,12 @@ app.get('/', (req, res) => {
     res.send(htmlComUrl);
 });
 
-// --- AUTH HELPERS ---
+// --- HELPER AUTH ---
 function getHeadOfficeToken() {
     let rawToken = process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
+    // Remove "Bearer" para evitar erro 403 da API
     if (rawToken.toLowerCase().startsWith('bearer')) {
         rawToken = rawToken.replace(/^bearer\s+/i, "").trim();
     }
@@ -59,28 +60,40 @@ function getGoogleAuth() {
     });
 }
 
-// --- PARSER DE DATA (PT-BR) ---
+// --- 1. PARSER DE DATAS BR (ROBUSTO) ---
 function parseDateFromTitle(title) {
     if (!title) return null;
     const lower = title.toLowerCase();
 
-    // Formato extenso: "14 de jan." ou "14 jan"
-    const meses = { "jan": 0, "fev": 1, "mar": 2, "abr": 3, "mai": 4, "jun": 5, "jul": 6, "ago": 7, "set": 8, "out": 9, "nov": 10, "dez": 11 };
-    const regexExt = /(\d{1,2})\s*(?:de)?\s*([a-z]{3})/;
+    // Mapa de meses (aceita abrev e full)
+    const meses = { 
+        "jan": 0, "fev": 1, "mar": 2, "abr": 3, "mai": 4, "jun": 5, "jul": 6, "ago": 7, "set": 8, "out": 9, "nov": 10, "dez": 11,
+        "janeiro": 0, "fevereiro": 1, "março": 2, "abril": 3, "maio": 4, "junho": 5, "julho": 6, "agosto": 7, "setembro": 8, "outubro": 9, "novembro": 10, "dezembro": 11
+    };
+
+    // 1. Tenta formato extenso: "14 de jan" ou "14 jan" ou "14 de janeiro"
+    // Regex captura dia e mês (primeiros 3 chars ou nome completo)
+    const regexExt = /(\d{1,2})\s*(?:de)?\s*([a-zç]{3,})/;
     let match = lower.match(regexExt);
 
     if (match) {
         const day = parseInt(match[1]);
-        const monthStr = match[2]; 
+        let monthStr = match[2];
+        // Normaliza "jan." para "jan"
+        if (monthStr.length > 3) monthStr = monthStr.substring(0, 3);
+        // Trata "março" -> "mar"
+        if (monthStr === 'mar' || monthStr === 'març') monthStr = 'mar';
+        
         const month = meses[monthStr];
         
+        // Tenta achar ano na string (ex: 2026), senão usa atual
         const yearMatch = lower.match(/20\d{2}/);
         const year = yearMatch ? parseInt(yearMatch[0]) : new Date().getFullYear();
 
         if (month !== undefined) return new Date(year, month, day);
     }
 
-    // Formato numérico: "14/01/26"
+    // 2. Tenta formato numérico: "14/01/26" ou "14-01-2026"
     const regexNum = /(\d{1,2})[\/\.\-](\d{1,2})(?:[\/\.\-](\d{2,4}))?/;
     match = lower.match(regexNum);
     
@@ -92,10 +105,10 @@ function parseDateFromTitle(title) {
         return new Date(year, month, day);
     }
 
-    return null;
+    return null; // Sem data identificável
 }
 
-// --- EXTRATOR DE TEXTO ---
+// --- 2. EXTRATOR DE TEXTO ---
 function readStructuralElements(elements) {
     let text = '';
     if (!elements) return text;
@@ -111,7 +124,7 @@ function readStructuralElements(elements) {
         } else if (element.table) {
             element.table.tableRows.forEach(row => {
                 row.tableCells.forEach(cell => {
-                    text += readStructuralElements(cell.content) + " "; 
+                    text += readStructuralElements(cell.content) + " | "; 
                 });
                 text += "\n";
             });
@@ -130,48 +143,54 @@ function extractJSON(text) {
     return text;
 }
 
-// --- CORTE CIRÚRGICO (NOVO!) ---
+// --- 3. CORTE INTELIGENTE ("SNIPER") ---
 function optimizeTextForGet(text) {
     if (!text) return "";
-    
-    // 1. Identifica onde começa o lixo (Rodapé do Google Meet)
-    const lower = text.toLowerCase();
-    
-    // Palavras que indicam o fim do conteúdo útil e começo do log de áudio
-    const endMarkers = [
-        "revise as anotações do gemini", 
-        "00:00:00", // Começo do timestamp
-        "envie feedback sobre o uso"
-    ];
+    let clean = text;
 
-    let cutoffIndex = text.length;
+    // A. Remove o Lixo (Rodapé e Transcrição Bruta)
+    const lower = clean.toLowerCase();
+    const endMarkers = ["revise as anotações do gemini", "00:00:00", "envie feedback sobre o uso", "transcrição\n00:"];
+    
+    let cutoff = clean.length;
+    for (const m of endMarkers) {
+        const idx = lower.indexOf(m);
+        if (idx !== -1 && idx < cutoff) cutoff = idx;
+    }
+    clean = clean.substring(0, cutoff).trim();
 
-    for (const marker of endMarkers) {
-        const idx = lower.indexOf(marker);
-        if (idx !== -1 && idx < cutoffIndex) {
-            cutoffIndex = idx;
-        }
+    // B. Compressão de Espaços
+    clean = clean.replace(/\n\s*\n/g, '\n').replace(/\s+/g, ' ');
+
+    // C. Estratégia de Corte para URL (Max ~1800 chars)
+    const MAX = 1800;
+    if (clean.length <= MAX) return clean;
+
+    // SE O TEXTO FOR GRANDE:
+    // Prioridade 1: O Início (Resumo)
+    // Prioridade 2: As "Próximas Etapas" (Geralmente no final ou buscáveis)
+    
+    // Tenta achar onde começam os "Próximos Passos"
+    const stepsMarkers = ["próximas etapas", "próximos passos", "ações futuras", "encaminhamentos"];
+    let stepsIdx = -1;
+    
+    for (const sm of stepsMarkers) {
+        const idx = clean.toLowerCase().lastIndexOf(sm);
+        if (idx !== -1) { stepsIdx = idx; break; }
     }
 
-    // Pega apenas o conteúdo útil (Resumo, Detalhes, Próximas Etapas)
-    let cleanText = text.substring(0, cutoffIndex);
-
-    // 2. Limpeza básica
-    cleanText = cleanText.replace(/\n\s*\n/g, '\n').replace(/\s+/g, ' ').trim();
-
-    // 3. Compressão para URL (GET)
-    // Se ainda for muito grande (ex: reunião de 3 horas resumida), pegamos o essencial.
-    const MAX_SAFE_CHARS = 1600; 
-
-    if (cleanText.length > MAX_SAFE_CHARS) {
-        // Estratégia: O "Ouro" está no INÍCIO (Resumo) e no FIM (Próximas Etapas) dessa seção limpa.
-        // O meio geralmente são os "Detalhes" longos.
-        const head = cleanText.substring(0, 900); // Garante o Resumo
-        const tail = cleanText.substring(cleanText.length - 700); // Garante as Próximas Etapas
-        return `${head}\n...[DETALHES INTERMEDIÁRIOS RESUMIDOS]...\n${tail}`;
+    if (stepsIdx !== -1) {
+        // Se achou "Próximos Passos", garante que eles entrem!
+        // Pega os primeiros 800 chars (Resumo) + Os 1000 chars a partir dos Próximos Passos
+        const head = clean.substring(0, 800);
+        const tail = clean.substring(stepsIdx, stepsIdx + 1000); // Pega 1000 chars a partir do marcador
+        return `${head} ... [MEIO OMITIDO] ... ${tail}`;
+    } else {
+        // Se não achou marcador explícito, pega Início e Fim (Sanduíche Clássico)
+        const head = clean.substring(0, 1000);
+        const tail = clean.substring(clean.length - 800);
+        return `${head} ... [MEIO OMITIDO] ... ${tail}`;
     }
-
-    return cleanText;
 }
 
 // --- BUSCAR ABAS ---
@@ -205,15 +224,18 @@ async function getAllTabsSorted(docId) {
             }
         });
     } else {
-        // Fallback Corpo
         const content = readStructuralElements(doc.body.content);
         if (content.trim().length > 0) {
-            tabsData.push({ title: "Documento Principal", date: null, timestamp: 0, content: content });
+            tabsData.push({ title: "Principal", date: null, timestamp: 0, content: content });
         }
     }
 
-    // Ordena: Antiga -> Recente
+    // ORDENAÇÃO CRÍTICA: Antiga -> Recente
     tabsData.sort((a, b) => a.timestamp - b.timestamp);
+    
+    // Debug de Datas no Log
+    tabsData.forEach(t => console.log(`[TAB] ${t.title} -> ${t.date ? t.date.toLocaleDateString() : 'S/D'}`));
+
     return tabsData;
 }
 
@@ -233,15 +255,13 @@ app.post('/api/empresas', async (req, res) => {
 });
 
 // ======================================================
-// LÓGICA DE INTELIGÊNCIA (DIRECTOR MODE + FIX 414)
+// LÓGICA DE INTELIGÊNCIA (DIRECTOR MODE + SNIPER)
 // ======================================================
 
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     const authHeader = getHeadOfficeToken();
-    let debugLogs = [];
-
-    // Variáveis de escopo seguro
+    
     let docId = null;
     let docUrl = null;
 
@@ -264,7 +284,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
             }
         } catch (e) { console.warn("CSV Error"); }
 
-        if (!docId) return res.json({ success: false, error: `Link não encontrado na planilha.` });
+        if (!docId) return res.json({ success: false, error: `Link não encontrado.` });
 
         // 2. LER ABAS (GCP)
         let allTabs = [];
@@ -277,16 +297,15 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
         // 3. ANÁLISE EM CADEIA
         let currentMemory = "Início da análise.";
-        console.log(`[IA] Processando ${allTabs.length} abas.`);
+        console.log(`[IA] Processando ${allTabs.length} abas em ordem cronológica.`);
 
         for (let i = 0; i < allTabs.length; i++) {
             const tab = allTabs[i];
             const isLast = i === allTabs.length - 1;
             
-            // --- CORTE ESTRATÉGICO ---
+            // --- CORTE ESTRATÉGICO PARA GET ---
             const cleanContent = optimizeTextForGet(tab.content);
-            
-            console.log(`[IA] Aba ${i+1}: "${tab.title}". Original: ${tab.content.length} -> Limpo: ${cleanContent.length}`);
+            console.log(`[IA] Aba ${i+1} (${tab.title}): ${cleanContent.length} chars enviados.`);
 
             let prompt = "";
             let contextForUrl = "";
@@ -294,7 +313,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
             if (!isLast) {
                 // ABAS PASSADAS: Acumula contexto
                 prompt = `ATUE COMO CS MANAGER.
-                REUNIÃO ANTERIOR: ${tab.title}.
+                REUNIÃO PASSADA: ${tab.title}.
                 
                 MEMÓRIA ATUAL: ${currentMemory}
                 
@@ -305,30 +324,29 @@ app.post('/api/resumir-empresa', async (req, res) => {
                 Atualize a memória com fatos importantes (sentimento, decisões).
                 Seja conciso (max 400 chars).`;
                 
-                // Limite seguro para o GET
                 contextForUrl = `MEMÓRIA: ${currentMemory.slice(0, 500)}`; 
 
             } else {
-                // ABA FINAL (DIRETOR DE CS)
+                // ABA FINAL: O Diretor assume
                 prompt = `ATUE COMO DIRETOR DE CS. ESTA É A ÚLTIMA REUNIÃO (${tab.title}).
                 
                 --- MISSÃO FINAL ---
                 Gere o Relatório de Inteligência Estratégico.
                 
                 DADOS DE ENTRADA:
-                1. Histórico Prévio: ${currentMemory.slice(0, 600)}
-                2. TEXTO DA ÚLTIMA REUNIÃO:
+                1. Histórico Prévio (Perfil/Sentimento): ${currentMemory.slice(0, 600)}
+                2. TEXTO DA ÚLTIMA REUNIÃO (Checkpoints/Próximos Passos):
                 ${cleanContent}
                 
                 REGRAS:
                 - Use o "TEXTO DA ÚLTIMA REUNIÃO" para preencher 'checkpoints_feitos' e 'proximos_passos'.
-                - Se o texto tiver nomes reais (Barbara, Felipe, William), use-os.
+                - Se o texto citar Felipe, Barbara, William, use os nomes.
                 
                 JSON ESTRITO:
                 {"resumo_executivo": "...", "perfil_cliente": "...", "estrategia_relacionamento": "...", "checkpoints_feitos": [], "proximos_passos": [], "riscos_bloqueios": "...", "sentimento_score": "0-10", "status_projeto": "Em Dia/Atrasado"}`;
             }
 
-            // CHAMADA GET (Strict)
+            // CHAMADA GET (Safe)
             let respostaIA = "";
             for (let retry = 0; retry < 2; retry++) {
                 try {
@@ -337,12 +355,10 @@ app.post('/api/resumir-empresa', async (req, res) => {
                             aiName: BOT_NAME,
                             aiId: BOT_ID,
                             question: prompt,
-                            // O Contexto pode ir na URL se for pequeno, ou omitido se já estiver no prompt
-                            // Aqui o prompt da aba final JÁ CONTÉM o texto limpo, então não precisamos duplicar no param 'context'
-                            context: isLast ? "Foco na última reunião." : contextForUrl 
+                            context: isLast ? "Foco na última reunião." : contextForUrl // O prompt final já tem o texto embutido
                         },
                         headers: { 'Authorization': authHeader },
-                        timeout: 45000
+                        timeout: 40000
                     });
                     
                     const tResp = response.data.text || response.data.answer;
@@ -354,13 +370,10 @@ app.post('/api/resumir-empresa', async (req, res) => {
                     console.error(`Erro IA Aba ${i}: ${e.message}`);
                     if (e.response && e.response.status === 414) {
                         try {
-                            // Se der 414 na última, enviamos um prompt menor
-                            const fallbackPrompt = isLast 
-                                ? `Gere JSON de status CS para esta reunião: ${cleanContent.slice(0, 800)}...`
-                                : `Resuma fatos.`;
-                                
+                            // Fallback: Reduz contexto para 500 chars se der erro de URL
+                            const miniContext = contextForUrl.slice(0, 500);
                             const r2 = await axios.get(`${BASE_URL}/openai/question`, {
-                                params: { aiName: BOT_NAME, aiId: BOT_ID, question: fallbackPrompt },
+                                params: { aiName: BOT_NAME, aiId: BOT_ID, question: prompt, context: miniContext },
                                 headers: { 'Authorization': authHeader }
                             });
                             respostaIA = r2.data.text || r2.data.answer;
@@ -371,8 +384,6 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
             if (respostaIA) {
                 currentMemory = respostaIA;
-            } else {
-                debugLogs.push(`Falha Aba ${tab.title}`);
             }
         }
 
@@ -391,7 +402,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
         if (score >= 8) scoreColor = "text-emerald-400 border-emerald-500/30 bg-emerald-500/10";
         if (score <= 4) scoreColor = "text-red-400 border-red-500/30 bg-red-500/10";
 
-        const lastTabName = allTabs.length > 0 ? allTabs[allTabs.length-1].title : "N/A";
+        const lastTabName = allTabs.length > 0 ? allTabs[allTabs.length-1].title : "Geral";
 
         const htmlResumo = `
             <div class="space-y-4 font-sans">
@@ -472,7 +483,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
     }
 });
 
-// --- ROTA DE TESTE ---
+// --- ROTA TESTE ---
 app.get('/api/debug-bot', async (req, res) => {
     try {
         const rawToken = getHeadOfficeToken();
@@ -486,7 +497,7 @@ app.get('/api/debug-bot', async (req, res) => {
 
 module.exports = app;
 
-// --- FRONTEND ---
+// --- FRONTEND MANTIDO (IGUAL ANTERIOR) ---
 const DASHBOARD_HTML = `
 <!DOCTYPE html>
 <html lang="pt-BR">
