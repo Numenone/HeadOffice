@@ -26,6 +26,28 @@ app.get('/', (req, res) => {
     res.send(htmlComUrl);
 });
 
+// --- ROTA NOVA: PROXY DE LEITURA (O Segredo) ---
+// Essa rota serve o texto completo para a IA ler, "enganando" o bloqueio do Google e o limite de URL.
+app.get('/api/doc-content', async (req, res) => {
+    const { docId } = req.query;
+    if (!docId) return res.status(400).send("Faltou docId");
+
+    try {
+        // Baixa o texto puro do Google
+        const googleUrl = `https://docs.google.com/document/d/${docId}/export?format=txt`;
+        const response = await axios.get(googleUrl, {
+            // Headers para parecer um navegador e não ser bloqueado
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36' }
+        });
+        
+        // Retorna o texto puro para quem chamou (no caso, a IA da HeadOffice)
+        res.header('Content-Type', 'text/plain');
+        res.send(response.data);
+    } catch (error) {
+        res.status(500).send("Erro ao ler documento original: " + error.message);
+    }
+});
+
 app.get('/api/empresas', async (req, res) => {
     const { data, error } = await supabase.from('empresas').select('*').order('nome', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
@@ -40,7 +62,7 @@ app.post('/api/empresas', async (req, res) => {
     res.json({ success: true, data });
 });
 
-// --- ROTA DE RESUMO (LINK TXT) ---
+// --- ROTA DE RESUMO (BRIDGE STRATEGY) ---
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     
@@ -51,59 +73,73 @@ app.post('/api/resumir-empresa', async (req, res) => {
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
     if (rawToken.toLowerCase().startsWith('bearer ')) rawToken = rawToken.substring(7).trim();
     
-    const authHeader = rawToken;
-
     if (rawToken.length < 20) return res.status(500).json({ error: "Token JWT inválido." });
+    const authHeader = rawToken;
 
     let step = "Início";
     let docUrl = null;
+    let extractedDocId = null;
 
     try {
-        // PASSO 1: Encontrar Link (CSV ou IA)
-        step = "Baixando CSV";
+        // PASSO 1: Encontrar o Link
+        step = "Buscando Link no CSV";
         try {
             const csvResponse = await axios.get(SHEET_CSV_URL);
             const lines = csvResponse.data.split('\n');
             for (const line of lines) {
                 if (line.toLowerCase().includes(nome.toLowerCase())) {
-                    const match = line.match(/(https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+)/);
-                    if (match) { docUrl = match[0]; break; }
+                    const match = line.match(/(https:\/\/docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+))/);
+                    if (match) { 
+                        docUrl = match[0];
+                        extractedDocId = match[2]; // Captura o ID isolado
+                        break; 
+                    }
                 }
             }
         } catch (e) { console.warn("CSV falhou."); }
 
+        // Fallback IA
         if (!docUrl) {
-            step = "Perguntando à IA (Fallback Link)";
-            // Aqui usamos GET normal, pois a pergunta é curta
+            step = "Buscando Link via IA";
             const aiSearch = await axios.get(`${BASE_URL}/openai/question`, {
                 params: {
                     aiName: 'Roger', 
                     context: `Planilha: ${SHEET_FULL_URL}`,
-                    question: `Encontre a empresa "${nome}". Extraia a URL do Google Docs. Retorne APENAS a URL.`
+                    question: `Encontre a empresa "${nome}". Retorne a URL do Google Docs.`
                 },
                 headers: { 'Authorization': authHeader }
             });
             const answerAI = aiSearch.data.answer || "";
-            const matchAI = answerAI.match(/(https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+)/);
-            if (matchAI) docUrl = matchAI[0];
+            const matchAI = answerAI.match(/(https:\/\/docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+))/);
+            if (matchAI) {
+                docUrl = matchAI[0];
+                extractedDocId = matchAI[2];
+            }
         }
 
-        if (!docUrl) return res.json({ success: false, error: `Link não encontrado para ${nome}.` });
+        if (!extractedDocId) return res.json({ success: false, error: `Doc não encontrado para ${nome}.` });
 
-        // PASSO 2: CONVERTER LINK PARA TXT
-        // Transformamos o link visual em link de texto puro para a IA conseguir ler sem travar no HTML
-        const txtUrl = `${docUrl}/export?format=txt`;
-        console.log(`[SUCESSO] Enviando link TXT para a IA: ${txtUrl}`);
+        // PASSO 2: CRIAR O LINK PROXY (A Solução Mágica)
+        // Geramos um link do nosso próprio servidor que serve o texto completo.
+        const currentHost = req.headers.host; // ex: head-office-one.vercel.app
+        const protocol = req.headers.host.includes('localhost') ? 'http' : 'https';
+        const proxyUrl = `${protocol}://${currentHost}/api/doc-content?docId=${extractedDocId}`;
 
-        // PASSO 3: RESUMIR (Enviando a URL do TXT no contexto)
-        step = "Chamando IA com Link TXT";
+        console.log(`[PROXY] Criado link intermediário: ${proxyUrl}`);
+
+        // PASSO 3: IA LÊ O PROXY
+        step = "Enviando para IA (Leitura Completa)";
         
-        // Aqui enviamos 'txtUrl' no context. Como é uma URL curta, NÃO vai dar erro 414.
+        // Enviamos para a IA o link do proxy. Como é uma URL, ela acessa via GET.
+        // O proxy retorna o texto COMPLETO (sem limite de URL).
         const summaryResponse = await axios.get(`${BASE_URL}/openai/question`, {
             params: {
                 aiName: 'Roger',
-                context: `Leia o conteúdo deste link de texto puro: ${txtUrl}`,
-                question: `Aja como Gerente. Leia o texto do link acima. Identifique a ÚLTIMA data registrada. Resuma. 
+                // A IA vai ler o conteúdo que está nesta URL (nosso proxy)
+                context: `O documento completo está neste link de texto puro: ${proxyUrl}`,
+                question: `Aja como Gerente de Projetos. Leia TODO o conteúdo do link fornecido. 
+                Identifique a ÚLTIMA data/sessão registrada no final do arquivo.
+                Gere um resumo executivo do status atual.
                 Retorne JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico/Neutro", "status_projeto": "Em Dia/Atrasado"}`
             },
             headers: { 'Authorization': authHeader }
@@ -117,6 +153,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
         try {
             result = JSON.parse(answerRaw);
         } catch (e) {
+            console.error("[PARSE ERROR]", answerRaw);
             result = { resumo: answerRaw.substring(0, 500), status_cliente: "Erro Parse", status_projeto: "Erro Parse" };
         }
 
@@ -134,17 +171,14 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
     } catch (error) {
         console.error(`[ERRO] ${step}:`, error.message);
-        
-        // Captura o erro 414 ou outros
         const errorDetail = error.response ? JSON.stringify(error.response.data) : error.message;
-        
         res.status(500).json({ error: "Falha técnica", step, details: errorDetail });
     }
 });
 
 module.exports = app;
 
-// --- FRONTEND (Mantenha igual) ---
+// --- FRONTEND ---
 const DASHBOARD_HTML = `
 <!DOCTYPE html>
 <html lang="pt-BR">
