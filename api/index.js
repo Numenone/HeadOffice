@@ -37,7 +37,6 @@ function getHeadOfficeToken() {
     let rawToken = TOKEN_DE_EMERGENCIA || process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
-    if (rawToken.toLowerCase().startsWith('bearer ')) rawToken = rawToken.substring(7).trim();
     return rawToken.length > 10 ? rawToken : null;
 }
 
