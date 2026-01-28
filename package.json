@@ -1,4 +1,11 @@
 {
+"name": "headoffice-agent",
+  "version": "1.0.0",
+  "description": "API do Agente HeadOffice",
+  "main": "api/index.js",
+  "scripts": {
+    "start": "node api/index.js"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.93.2",
     "axios": "^1.13.4",
