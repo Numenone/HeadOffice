@@ -71,10 +71,11 @@ app.post('/api/resumir-empresa', async (req, res) => {
     let rawToken = TOKEN_DE_EMERGENCIA || process.env.HEADOFFICE_JWT || "";
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
-    if (rawToken.toLowerCase().startsWith('bearer ')) rawToken = rawToken.substring(7).trim();
+
+    // Garante que não tenha o prefixo "Bearer"
+    const authHeader = rawToken.replace(/^bearer\s+/i, '');
     
-    if (rawToken.length < 20) return res.status(500).json({ error: "Token JWT inválido." });
-    const authHeader = rawToken;
+    if (authHeader.length < 20) return res.status(500).json({ error: "Token JWT inválido." });
 
     let step = "Início";
     let docUrl = null;
