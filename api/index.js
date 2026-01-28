@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
+const { google } = require('googleapis'); // BIBLIOTECA OFICIAL
 
 const app = express();
 
@@ -31,43 +32,60 @@ app.get('/', (req, res) => {
     res.send(htmlComUrl);
 });
 
-// --- HELPER AUTH (HEADOFFICE) ---
+// --- HELPER AUTH HEADOFFICE ---
 function getHeadOfficeToken() {
-    const TOKEN_DE_EMERGENCIA = ""; 
-    let rawToken = TOKEN_DE_EMERGENCIA || process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
+    let rawToken = process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
+    if (rawToken.toLowerCase().startsWith('bearer ')) rawToken = rawToken.substring(7).trim();
     return rawToken.length > 10 ? rawToken : null;
 }
 
-// --- HELPER GOOGLE DOCS API (GCP) ---
+// --- HELPER GOOGLE DOCS (SERVICE ACCOUNT) ---
 async function getGoogleDocContent(docId) {
-    const apiKey = process.env.GOOGLE_API_KEY; // SUA CHAVE DO GCP AQUI
-    if (!apiKey) throw new Error("GOOGLE_API_KEY não configurada na Vercel.");
-
     try {
-        const url = `https://docs.googleapis.com/v1/documents/${docId}?key=${apiKey}`;
-        const response = await axios.get(url);
-        const doc = response.data;
-        
-        // O Google devolve um JSON complexo. Precisamos extrair o texto de cada parágrafo.
-        let fullText = "";
-        if (doc.body && doc.body.content) {
-            doc.body.content.forEach(struc => {
-                if (struc.paragraph) {
-                    struc.paragraph.elements.forEach(elem => {
-                        if (elem.textRun) {
-                            fullText += elem.textRun.content;
-                        }
-                    });
-                }
-            });
+        // Formata a chave privada (corrige quebras de linha da Vercel)
+        const privateKey = process.env.GOOGLE_PRIVATE_KEY 
+            ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') 
+            : undefined;
+
+        if (!privateKey || !process.env.GOOGLE_CLIENT_EMAIL) {
+            throw new Error("Credenciais do Google (Service Account) não configuradas na Vercel.");
         }
+
+        const auth = new google.auth.GoogleAuth({
+            credentials: {
+                client_email: process.env.GOOGLE_CLIENT_EMAIL,
+                private_key: privateKey,
+            },
+            scopes: ['https://www.googleapis.com/auth/documents.readonly'],
+        });
+
+        const client = await auth.getClient();
+        const docs = google.docs({ version: 'v1', auth: client });
+
+        const res = await docs.documents.get({ documentId: docId });
+        const content = res.data.body.content;
+
+        // Extrai texto puro da estrutura JSON do Google
+        let fullText = '';
+        content.forEach(element => {
+            if (element.paragraph) {
+                element.paragraph.elements.forEach(el => {
+                    if (el.textRun) {
+                        fullText += el.textRun.content;
+                    }
+                });
+            }
+        });
+
         return fullText;
+
     } catch (error) {
-        if (error.response && error.response.status === 403) {
-            throw new Error("Permissão negada pelo Google. O documento precisa estar público (Leitor) ou a API Key não tem acesso.");
+        if (error.code === 403 || (error.response && error.response.status === 403)) {
+            throw new Error(`PERMISSÃO NEGADA. Você compartilhou o Doc com o e-mail do robô? (${process.env.GOOGLE_CLIENT_EMAIL})`);
         }
+        if (error.code === 404) throw new Error("Documento não encontrado (404). Verifique o Link.");
         throw error;
     }
 }
@@ -108,7 +126,7 @@ app.post('/api/empresas', async (req, res) => {
 });
 
 // ======================================================
-// LÓGICA DE INTELIGÊNCIA ARTIFICIAL (CS INTELLIGENCE V2)
+// LÓGICA DE INTELIGÊNCIA ARTIFICIAL (CS INTELLIGENCE V3)
 // ======================================================
 
 app.post('/api/resumir-empresa', async (req, res) => {
@@ -141,14 +159,13 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
         if (!docUrl) return res.json({ success: false, error: `Link não encontrado na planilha para ${nome}.` });
 
-        // 2. Extração via GCP (INFALÍVEL SE TIVER PERMISSÃO)
-        step = `Lendo Google Docs (API Oficial)`;
+        // 2. Extração via OAUTH SERVICE ACCOUNT
+        step = `Lendo Google Docs (Service Account)`;
         let fullText = "";
         
         try {
             fullText = await getGoogleDocContent(docId);
             
-            // Validação Anti-Alucinação
             if (!fullText || fullText.trim().length < 20) {
                 return res.json({ success: false, error: "O documento está vazio. A IA não tem o que ler." });
             }
@@ -156,44 +173,42 @@ app.post('/api/resumir-empresa', async (req, res) => {
             console.error("Erro GCP:", apiError.message);
             return res.json({ 
                 success: false, 
-                error: `Erro ao ler Doc via Google API: ${apiError.message}. Verifique se o doc é público e se a API Key está válida.` 
+                error: apiError.message 
             });
         }
 
         // 3. ANÁLISE PROFUNDA (CHAIN)
         step = "Processamento Neural CS";
-        
-        // Pega os últimos 20.000 caracteres para ter muito contexto
-        const relevantText = fullText.slice(-20000); 
-        const chunks = splitText(relevantText, 3000); // 3k chars por chunk
-        console.log(`[CHAIN] Processando ${chunks.length} blocos de texto real.`);
+        const relevantText = fullText.slice(-25000); // 25k chars
+        const chunks = splitText(relevantText, 3500); // 3.5k chars por chunk
+        console.log(`[CHAIN] Processando ${chunks.length} blocos.`);
 
         let currentMemory = "";
 
         for (let i = 0; i < chunks.length; i++) {
             const chunk = chunks[i];
             const isLast = i === chunks.length - 1;
-            const safeMemory = currentMemory.length > 1500 ? currentMemory.substring(0, 1500) + "..." : currentMemory;
+            const safeMemory = currentMemory.length > 2000 ? currentMemory.substring(0, 2000) + "..." : currentMemory;
 
             // --- PROMPT CS SÊNIOR (ANTI-ALUCINAÇÃO) ---
             const prompt = isLast 
                 ? `ATUE COMO UM SÊNIOR CUSTOMER SUCCESS MANAGER.
-                   Analise o texto real fornecido abaixo (transcrição de reunião/doc).
+                   Analise o texto real da transcrição abaixo.
                    
-                   🚨 REGRA CRÍTICA: Se o texto não contiver informações suficientes, escreva "Não informado no texto" no campo correspondente. NUNCA INVENTE DADOS ("A conta X", "01/01/2022"). USE APENAS FATOS DO TEXTO.
+                   🚨 REGRA: USE APENAS FATOS DO TEXTO. Se não houver informação, escreva "Não mencionado".
 
-                   Gere um Relatório de Inteligência JSON estrito:
+                   Gere um Relatório JSON estrito:
                    {
-                      "resumo_executivo": "Onde estamos HOJE? Qual o foco da semana? Use nomes reais citados.",
-                      "perfil_cliente": "Psicologia do cliente: Ele é detalhista? Apressado? Visionário? Como ele reage a problemas?",
-                      "estrategia_relacionamento": "Como o CS deve agir? (Ex: 'Seja proativo no WhatsApp', 'Formalize tudo por email').",
-                      "checkpoints_concluidos": ["Lista do que FOI FEITO recentemente"],
-                      "proximos_passos": ["Lista do que SERÁ FEITO e QUEM fará"],
-                      "riscos_bloqueios": "O que está impedindo o sucesso? Alguma reclamação?",
-                      "sentimento_score": "Número de 0 a 10 (0=Furioso, 10=Fã)",
+                      "resumo_executivo": "Resumo situacional. Use nomes e fatos citados.",
+                      "perfil_cliente": "Análise comportamental do cliente baseada na fala dele.",
+                      "estrategia_relacionamento": "Ação recomendada para o CS (Ex: Acalmar cliente, Cobrar feedback).",
+                      "checkpoints_feitos": ["Lista do que FOI FEITO"],
+                      "proximos_passos": ["Lista do que SERÁ FEITO"],
+                      "riscos_bloqueios": "Reclamações ou impedimentos citados.",
+                      "sentimento_score": "Número 0-10",
                       "status_projeto": "Em Dia/Atrasado/Pausado"
                    }`
-                : `Analise este trecho da transcrição. Extraia fatos, datas e sentimentos. Ignore conversas fiadas ("bom dia"). Acumule inteligência para o relatório final.`;
+                : `Analise este trecho. Extraia fatos, datas e sentimentos. Ignore saudações. Acumule inteligência.`;
 
             let respostaIA = "";
             for (let retry = 0; retry < 2; retry++) {
@@ -202,7 +217,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
                         params: {
                             aiName: BOT_NAME,
                             aiId: BOT_ID,
-                            context: `CONTEXTO ACUMULADO: ${safeMemory || "Início da leitura"}\n\nTEXTO ORIGINAL DO DOC:\n${chunk}`,
+                            context: `CONTEXTO ACUMULADO: ${safeMemory || "Início"}\n\nTEXTO DO DOC:\n${chunk}`,
                             question: prompt
                         },
                         headers: { 'Authorization': authHeader }
@@ -219,9 +234,9 @@ app.post('/api/resumir-empresa', async (req, res) => {
             if (respostaIA) currentMemory = respostaIA;
         }
 
-        // 4. RENDERIZAÇÃO VISUAL (FRONTEND INSIDE BACKEND)
+        // 4. RENDERIZAÇÃO
         step = "Gerando Visualização";
-        if (!currentMemory) return res.json({ success: false, error: `IA não retornou análise.` });
+        if (!currentMemory) return res.json({ success: false, error: `IA muda.` });
 
         const jsonOnly = extractJSON(currentMemory);
         let data = {};
@@ -232,7 +247,6 @@ app.post('/api/resumir-empresa', async (req, res) => {
             data = { resumo_executivo: "Erro ao estruturar dados: " + currentMemory.substring(0, 200) };
         }
 
-        // Definição de Cores baseada no Score
         const score = parseInt(data.sentimento_score) || 5;
         let scoreColor = "text-yellow-400 border-yellow-500/30 bg-yellow-500/10";
         if (score >= 8) scoreColor = "text-emerald-400 border-emerald-500/30 bg-emerald-500/10";
@@ -280,9 +294,9 @@ app.post('/api/resumir-empresa', async (req, res) => {
                 </div>
 
                 <div class="flex gap-2 items-stretch">
-                    <div class="flex-1 ${data.riscos_bloqueios ? 'bg-red-500/10 border-red-500/20' : 'bg-slate-800/50 border-white/5'} border p-2 rounded flex flex-col justify-center">
-                        <span class="text-[9px] uppercase font-bold ${data.riscos_bloqueios ? 'text-red-400' : 'text-slate-500'} block mb-1">Pontos de Atenção</span>
-                        <p class="text-[10px] ${data.riscos_bloqueios ? 'text-red-200' : 'text-slate-500'} leading-tight">${data.riscos_bloqueios || "Nenhum risco crítico detectado."}</p>
+                    <div class="flex-1 ${data.riscos_bloqueios && data.riscos_bloqueios.length > 5 ? 'bg-red-500/10 border-red-500/20' : 'bg-slate-800/50 border-white/5'} border p-2 rounded flex flex-col justify-center">
+                        <span class="text-[9px] uppercase font-bold ${data.riscos_bloqueios && data.riscos_bloqueios.length > 5 ? 'text-red-400' : 'text-slate-500'} block mb-1">Pontos de Atenção</span>
+                        <p class="text-[10px] ${data.riscos_bloqueios && data.riscos_bloqueios.length > 5 ? 'text-red-200' : 'text-slate-500'} leading-tight">${data.riscos_bloqueios || "Nenhum risco crítico."}</p>
                     </div>
                     <div class="w-16 flex flex-col items-center justify-center p-1 rounded border ${scoreColor}">
                         <span class="text-[8px] uppercase font-bold opacity-70">Score</span>
@@ -293,7 +307,6 @@ app.post('/api/resumir-empresa', async (req, res) => {
             </div>
         `;
 
-        // Salvar
         const updatePayload = {
             doc_link: docUrl,
             resumo: htmlResumo,
@@ -312,20 +325,9 @@ app.post('/api/resumir-empresa', async (req, res) => {
     }
 });
 
-app.get('/api/debug-bot', async (req, res) => {
-    try {
-        const rawToken = getHeadOfficeToken();
-        const response = await axios.get(`${BASE_URL}/openai/question`, {
-            params: { aiName: BOT_NAME, aiId: BOT_ID, question: "Olá" },
-            headers: { 'Authorization': rawToken }
-        });
-        res.json({ text: response.data.text, full: response.data });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 module.exports = app;
 
-// --- FRONTEND PREMIUM (CYBERPUNK GLASS v3) ---
+// --- FRONTEND PREMIUM (MANTIDO) ---
 const DASHBOARD_HTML = `
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -338,8 +340,6 @@ const DASHBOARD_HTML = `
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@300;400;600;700;900&display=swap" rel="stylesheet">
     <style>
         body { font-family: 'Inter', sans-serif; background-color: #020617; color: #f8fafc; overflow-x: hidden; }
-        
-        /* Premium Card */
         .glass-card {
             background: rgba(15, 23, 42, 0.6);
             backdrop-filter: blur(12px);
@@ -353,14 +353,10 @@ const DASHBOARD_HTML = `
             box-shadow: 0 20px 40px -10px rgba(99, 102, 241, 0.15);
             background: rgba(30, 41, 59, 0.7);
         }
-
-        /* Status Pills */
         .badge { padding: 4px 10px; border-radius: 99px; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid; box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
         .st-Satisfeito, .st-EmDia { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
         .st-Crítico, .st-Atrasado, .st-Risco { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border-color: rgba(239, 68, 68, 0.3); }
         .st-Neutro, .st-EmAnálise { background: rgba(148, 163, 184, 0.15); color: #e2e8f0; border-color: rgba(148, 163, 184, 0.3); }
-
-        /* Grid Background */
         .bg-grid {
             background-image: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px);
             background-size: 30px 30px;
@@ -369,9 +365,7 @@ const DASHBOARD_HTML = `
 </head>
 <body class="min-h-screen bg-grid">
     <script>const API_URL = 'https://head-office-one.vercel.app';</script>
-    
     <div class="fixed top-0 w-full h-[2px] bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 z-50 shadow-[0_0_20px_rgba(99,102,241,0.5)]"></div>
-
     <div class="max-w-[1800px] mx-auto p-6 md:p-10">
         <header class="flex flex-col md:flex-row justify-between items-center mb-10 gap-6">
             <div class="flex items-center gap-4">
@@ -383,7 +377,6 @@ const DASHBOARD_HTML = `
                     <p class="text-slate-400 text-xs font-medium tracking-wide">REAL-TIME INTELLIGENCE FEED</p>
                 </div>
             </div>
-            
             <div class="flex items-center gap-3 w-full md:w-auto">
                 <div class="relative group">
                     <input type="text" id="newCompanyInput" placeholder="Nova Empresa..." 
@@ -395,37 +388,28 @@ const DASHBOARD_HTML = `
                 </button>
             </div>
         </header>
-
-        <div id="grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-6 pb-20">
-            </div>
+        <div id="grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-6 pb-20"></div>
     </div>
-
     <script>
         lucide.createIcons();
-
         async function loadCompanies() {
             const grid = document.getElementById('grid');
             grid.innerHTML = '<div class="col-span-full flex flex-col items-center justify-center py-32 opacity-60"><i data-lucide="loader" class="animate-spin w-10 h-10 text-indigo-500 mb-4"></i><p class="text-sm font-mono text-indigo-300">ESTABLISHING UPLINK...</p></div>';
             lucide.createIcons();
-
             try {
                 const res = await fetch(API_URL + '/api/empresas');
                 const data = await res.json();
                 grid.innerHTML = '';
-                
                 if(data.length === 0) { 
                     grid.innerHTML = '<div class="col-span-full text-center text-slate-600 py-32 font-mono">NO ACTIVE CLIENTS.</div>'; 
                     return; 
                 }
-
                 data.forEach(emp => {
                     const sCli = (emp.status_cliente || 'Neutro').replace(/\\s/g, '');
                     const sProj = (emp.status_projeto || 'EmAnálise').replace(/\\s/g, '');
-                    
                     const contentHtml = emp.resumo && emp.resumo.includes('<div') 
                         ? emp.resumo 
                         : \`<div class="flex flex-col items-center justify-center h-40 text-slate-500 gap-2"><i data-lucide="ghost" class="w-6 h-6 opacity-30"></i><p class="text-xs">Sem inteligência gerada.</p></div>\`;
-
                     grid.innerHTML += \`
                     <div class="glass-card rounded-2xl flex flex-col h-full relative group">
                         <div class="p-5 pb-3 border-b border-white/5">
@@ -438,11 +422,9 @@ const DASHBOARD_HTML = `
                                 <span class="badge st-\${sProj}">\${emp.status_projeto || '...'}</span>
                             </div>
                         </div>
-
                         <div class="p-5 flex-grow text-sm">
                             \${contentHtml}
                         </div>
-
                         <div class="p-4 mt-auto border-t border-white/5 bg-slate-900/30 rounded-b-2xl">
                             <button onclick="summarize('\${emp.nome}', \${emp.id})" id="btn-\${emp.id}" 
                                 class="w-full bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5 group-hover:border-indigo-500/30">
@@ -463,16 +445,13 @@ const DASHBOARD_HTML = `
                 grid.innerHTML = '<div class="col-span-full text-center text-red-400 font-mono py-20">SYSTEM FAILURE: API UNREACHABLE.</div>'; 
             }
         }
-
         async function summarize(nome, id) {
             const btn = document.getElementById('btn-' + id);
             const originalHTML = btn.innerHTML;
-            
             btn.disabled = true; 
             btn.className = "w-full bg-indigo-600/20 text-indigo-300 py-2.5 rounded-lg text-xs font-bold flex justify-center items-center gap-2 cursor-wait border border-indigo-500/30 animate-pulse";
             btn.innerHTML = '<i data-lucide="loader-2" class="animate-spin w-3 h-3"></i> EXTRAINDO INTELIGÊNCIA...';
             lucide.createIcons();
-
             try {
                 const res = await fetch(API_URL + '/api/resumir-empresa', {
                     method: 'POST',
@@ -480,7 +459,6 @@ const DASHBOARD_HTML = `
                     body: JSON.stringify({ nome, id })
                 });
                 const json = await res.json();
-                
                 if (json.success) { 
                     loadCompanies(); 
                 } else { 
@@ -492,7 +470,6 @@ const DASHBOARD_HTML = `
                 btn.innerHTML = 'ERRO DE CONEXÃO';
             } finally { 
                 if(!btn.innerHTML.includes('FALHA') && !btn.innerHTML.includes('ERRO')) {
-                    // Se deu certo, o loadCompanies vai sobrescrever o botão, então não precisamos resetar
                 } else {
                     setTimeout(() => { 
                         btn.disabled = false; 
@@ -503,7 +480,6 @@ const DASHBOARD_HTML = `
                 }
             }
         }
-
         async function addCompany() {
             const input = document.getElementById('newCompanyInput');
             const nome = input.value.trim();
@@ -514,7 +490,6 @@ const DASHBOARD_HTML = `
                 if(json.success) { input.value = ''; loadCompanies(); }
             } catch(e) {}
         }
-
         loadCompanies();
     </script>
 </body>
