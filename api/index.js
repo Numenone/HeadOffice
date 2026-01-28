@@ -71,7 +71,6 @@ app.post('/api/resumir-empresa', async (req, res) => {
     
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
-    if (rawToken.toLowerCase().startsWith('bearer ')) rawToken = rawToken.substring(7).trim();
     
     const authHeader = rawToken;
 
