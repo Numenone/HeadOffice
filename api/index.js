@@ -20,7 +20,7 @@ const SHEET_ID = '1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM';
 const SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=0`;
 const SHEET_FULL_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`;
 
-// ID DO BOT ROGER (Extraído do seu link)
+// ID DO BOT ROGER
 const BOT_ID = '69372353b11d9df606b68bf8';
 const BOT_NAME = 'Roger';
 
@@ -30,53 +30,12 @@ app.get('/', (req, res) => {
     res.send(htmlComUrl);
 });
 
-// --- ROTA DE DIAGNÓSTICO (Teste Simples) ---
-// Acesse https://sua-url.vercel.app/api/debug-bot para testar se o Roger responde
-app.get('/api/debug-bot', async (req, res) => {
-    try {
-        const rawToken = getAuthToken();
-        if (!rawToken) return res.status(500).json({ error: "Sem token configurado" });
-
-        const response = await axios.get(`${BASE_URL}/openai/question`, {
-            params: {
-                aiName: BOT_NAME,
-                aiId: BOT_ID, // Forçando pelo ID
-                question: "Responda apenas com a palavra: FUNCIONANDO"
-            },
-            headers: { 'Authorization': rawToken }
-        });
-
-        res.json({
-            status: "Teste realizado",
-            resposta_ia: response.data.answer || "VAZIA",
-            dados_completos: response.data
-        });
-    } catch (e) {
-        res.status(500).json({ error: e.message, details: e.response?.data });
-    }
-});
-
-app.get('/api/empresas', async (req, res) => {
-    const { data, error } = await supabase.from('empresas').select('*').order('nome', { ascending: true });
-    if (error) return res.status(500).json({ error: error.message });
-    res.json(data);
-});
-
-app.post('/api/empresas', async (req, res) => {
-    const { nome } = req.body;
-    if (!nome) return res.status(400).json({ error: "Nome obrigatório" });
-    const { data, error } = await supabase.from('empresas').insert([{ nome }]).select();
-    if (error) return res.status(500).json({ error: error.message });
-    res.json({ success: true, data });
-});
-
 // --- HELPER AUTH ---
 function getAuthToken() {
     const TOKEN_DE_EMERGENCIA = ""; 
     let rawToken = TOKEN_DE_EMERGENCIA || process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
-    if (rawToken.toLowerCase().startsWith('bearer ')) rawToken = rawToken.substring(7).trim();
     return rawToken.length > 10 ? rawToken : null;
 }
 
@@ -126,7 +85,6 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
         if (!docUrl) {
             step = "Buscando Link via IA";
-            // Aqui usamos ID e Nome para garantir
             const aiSearch = await axios.get(`${BASE_URL}/openai/question`, {
                 params: {
                     aiName: BOT_NAME,
@@ -136,7 +94,8 @@ app.post('/api/resumir-empresa', async (req, res) => {
                 },
                 headers: { 'Authorization': authHeader }
             });
-            const answerAI = aiSearch.data.answer || "";
+            // CORREÇÃO: Busca em .text OU .answer
+            const answerAI = aiSearch.data.text || aiSearch.data.answer || "";
             const matchAI = answerAI.match(/(https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+)/);
             if (matchAI) docUrl = matchAI[0];
         }
@@ -161,7 +120,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
         // 3. ANÁLISE EM CADEIA (CHAIN)
         step = "Análise Contínua";
-        const relevantText = fullText.slice(-12000); // 12k chars para segurança
+        const relevantText = fullText.slice(-12000); 
         const chunks = splitText(relevantText, 2000);
         console.log(`[CHAIN] ${chunks.length} partes.`);
 
@@ -176,8 +135,6 @@ app.post('/api/resumir-empresa', async (req, res) => {
                 ? `PARTE FINAL. Gere JSON estrito: {"resumo": "RESUMO AQUI", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico/Neutro", "status_projeto": "Em Dia/Atrasado"}`
                 : `Resuma brevemente este trecho e atualize o contexto.`;
 
-            // TENTATIVA DE RESPOSTA ROBUSTA
-            // Se falhar (vazio), tenta mais uma vez com prompt simplificado
             let respostaIA = "";
             
             for (let retry = 0; retry < 2; retry++) {
@@ -185,16 +142,19 @@ app.post('/api/resumir-empresa', async (req, res) => {
                     const response = await axios.get(`${BASE_URL}/openai/question`, {
                         params: {
                             aiName: BOT_NAME,
-                            aiId: BOT_ID, // Passando o ID explicitamente
+                            aiId: BOT_ID,
                             context: `RESUMO ANTERIOR: ${safeMemory || "Nenhum"}\n\nTEXTO ATUAL:\n${chunk}`,
                             question: prompt
                         },
                         headers: { 'Authorization': authHeader }
                     });
                     
-                    if (response.data.answer && response.data.answer.trim().length > 0) {
-                        respostaIA = response.data.answer;
-                        break; // Sucesso, sai do retry
+                    // CORREÇÃO CRÍTICA: Lendo 'text' em vez de 'answer'
+                    const textoResposta = response.data.text || response.data.answer;
+
+                    if (textoResposta && textoResposta.trim().length > 0) {
+                        respostaIA = textoResposta;
+                        break; 
                     }
                     console.log(`[RETRY] Tentativa ${retry+1} falhou (vazia).`);
                 } catch (e) { console.error("Erro na chamada IA:", e.message); }
@@ -203,7 +163,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
             if (respostaIA) {
                 currentMemory = respostaIA;
             } else {
-                console.warn(`[AVISO] O chunk ${i} foi ignorado pois a IA não respondeu.`);
+                console.warn(`[AVISO] Chunk ${i} ignorado.`);
             }
         }
 
@@ -211,11 +171,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
         step = "Processando JSON";
         
         if (!currentMemory) {
-             // Debug detalhado no erro
-             return res.json({ 
-                 success: false, 
-                 error: `IA muda. ID usado: ${BOT_ID}. Verifique em /api/debug-bot se ela responde.` 
-             });
+             return res.json({ success: false, error: `IA não retornou texto.` });
         }
 
         const jsonOnly = extractJSON(currentMemory);
@@ -247,6 +203,22 @@ app.post('/api/resumir-empresa', async (req, res) => {
         console.error(`[ERRO FATAL] ${step}:`, error.message);
         res.status(500).json({ error: "Erro Interno", step, details: error.message });
     }
+});
+
+// --- API DEBUG BOT (Atualizada) ---
+app.get('/api/debug-bot', async (req, res) => {
+    try {
+        const rawToken = getAuthToken();
+        const response = await axios.get(`${BASE_URL}/openai/question`, {
+            params: { aiName: BOT_NAME, aiId: BOT_ID, question: "Olá" },
+            headers: { 'Authorization': rawToken }
+        });
+        res.json({
+            campo_text: response.data.text,
+            campo_answer: response.data.answer,
+            full_response: response.data
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 module.exports = app;
