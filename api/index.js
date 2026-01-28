@@ -26,28 +26,6 @@ app.get('/', (req, res) => {
     res.send(htmlComUrl);
 });
 
-// --- ROTA NOVA: PROXY DE LEITURA (O Segredo) ---
-// Essa rota serve o texto completo para a IA ler, "enganando" o bloqueio do Google e o limite de URL.
-app.get('/api/doc-content', async (req, res) => {
-    const { docId } = req.query;
-    if (!docId) return res.status(400).send("Faltou docId");
-
-    try {
-        // Baixa o texto puro do Google
-        const googleUrl = `https://docs.google.com/document/d/${docId}/export?format=txt`;
-        const response = await axios.get(googleUrl, {
-            // Headers para parecer um navegador e não ser bloqueado
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36' }
-        });
-        
-        // Retorna o texto puro para quem chamou (no caso, a IA da HeadOffice)
-        res.header('Content-Type', 'text/plain');
-        res.send(response.data);
-    } catch (error) {
-        res.status(500).send("Erro ao ler documento original: " + error.message);
-    }
-});
-
 app.get('/api/empresas', async (req, res) => {
     const { data, error } = await supabase.from('empresas').select('*').order('nome', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
@@ -62,7 +40,16 @@ app.post('/api/empresas', async (req, res) => {
     res.json({ success: true, data });
 });
 
-// --- ROTA DE RESUMO (BRIDGE STRATEGY) ---
+// --- FUNÇÃO AUXILIAR: QUEBRAR TEXTO ---
+function splitText(text, chunkSize) {
+    const chunks = [];
+    for (let i = 0; i < text.length; i += chunkSize) {
+        chunks.push(text.substring(i, i + chunkSize));
+    }
+    return chunks;
+}
+
+// --- ROTA DE RESUMO COM CONTINUIDADE (CHAINING) ---
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     
@@ -71,97 +58,134 @@ app.post('/api/resumir-empresa', async (req, res) => {
     let rawToken = TOKEN_DE_EMERGENCIA || process.env.HEADOFFICE_JWT || "";
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
-
-    // Garante que não tenha o prefixo "Bearer"
-    const authHeader = rawToken.replace(/^bearer\s+/i, '');
+    if (rawToken.toLowerCase().startsWith('bearer ')) rawToken = rawToken.substring(7).trim();
     
-    if (authHeader.length < 20) return res.status(500).json({ error: "Token JWT inválido." });
+    const authHeader = rawToken;
+    if (rawToken.length < 20) return res.status(500).json({ error: "Token JWT inválido." });
 
     let step = "Início";
     let docUrl = null;
-    let extractedDocId = null;
 
     try {
-        // PASSO 1: Encontrar o Link
+        // 1. Encontrar Link
         step = "Buscando Link no CSV";
         try {
             const csvResponse = await axios.get(SHEET_CSV_URL);
             const lines = csvResponse.data.split('\n');
             for (const line of lines) {
                 if (line.toLowerCase().includes(nome.toLowerCase())) {
-                    const match = line.match(/(https:\/\/docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+))/);
-                    if (match) { 
-                        docUrl = match[0];
-                        extractedDocId = match[2]; // Captura o ID isolado
-                        break; 
-                    }
+                    const match = line.match(/(https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+)/);
+                    if (match) { docUrl = match[0]; break; }
                 }
             }
         } catch (e) { console.warn("CSV falhou."); }
 
-        // Fallback IA
         if (!docUrl) {
-            step = "Buscando Link via IA";
+            // Fallback IA
             const aiSearch = await axios.get(`${BASE_URL}/openai/question`, {
                 params: {
                     aiName: 'Roger', 
                     context: `Planilha: ${SHEET_FULL_URL}`,
-                    question: `Encontre a empresa "${nome}". Retorne a URL do Google Docs.`
+                    question: `Encontre a empresa "${nome}". Extraia a URL do Docs.`
                 },
                 headers: { 'Authorization': authHeader }
             });
             const answerAI = aiSearch.data.answer || "";
-            const matchAI = answerAI.match(/(https:\/\/docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+))/);
-            if (matchAI) {
-                docUrl = matchAI[0];
-                extractedDocId = matchAI[2];
-            }
+            const matchAI = answerAI.match(/(https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+)/);
+            if (matchAI) docUrl = matchAI[0];
         }
 
-        if (!extractedDocId) return res.json({ success: false, error: `Doc não encontrado para ${nome}.` });
+        if (!docUrl) return res.json({ success: false, error: `Link não encontrado para ${nome}.` });
 
-        // PASSO 2: CRIAR O LINK PROXY (A Solução Mágica)
-        // Geramos um link do nosso próprio servidor que serve o texto completo.
-        const currentHost = req.headers.host; // ex: head-office-one.vercel.app
-        const protocol = req.headers.host.includes('localhost') ? 'http' : 'https';
-        const proxyUrl = `${protocol}://${currentHost}/api/doc-content?docId=${extractedDocId}`;
-
-        console.log(`[PROXY] Criado link intermediário: ${proxyUrl}`);
-
-        // PASSO 3: IA LÊ O PROXY
-        step = "Enviando para IA (Leitura Completa)";
-        
-        // Enviamos para a IA o link do proxy. Como é uma URL, ela acessa via GET.
-        // O proxy retorna o texto COMPLETO (sem limite de URL).
-        const summaryResponse = await axios.get(`${BASE_URL}/openai/question`, {
-            params: {
-                aiName: 'Roger',
-                // A IA vai ler o conteúdo que está nesta URL (nosso proxy)
-                context: `O documento completo está neste link de texto puro: ${proxyUrl}`,
-                question: `Aja como Gerente de Projetos. Leia TODO o conteúdo do link fornecido. 
-                Identifique a ÚLTIMA data/sessão registrada no final do arquivo.
-                Gere um resumo executivo do status atual.
-                Retorne JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico/Neutro", "status_projeto": "Em Dia/Atrasado"}`
-            },
-            headers: { 'Authorization': authHeader }
-        });
-
-        // Tratamento
-        let result = {};
-        let answerRaw = summaryResponse.data.answer || "";
-        answerRaw = answerRaw.replace(/```json/g, '').replace(/```/g, '').trim();
-        
+        // 2. Baixar Texto Completo
+        step = `Baixando Histórico`;
+        const txtUrl = `${docUrl}/export?format=txt`;
+        let fullText = "";
         try {
-            result = JSON.parse(answerRaw);
+            const textResponse = await axios.get(txtUrl);
+            fullText = typeof textResponse.data === 'string' ? textResponse.data : JSON.stringify(textResponse.data);
+        } catch (downloadError) {
+            return res.json({ success: false, error: "Falha ao baixar texto do Doc." });
+        }
+
+        // 3. ESTRATÉGIA "MEMÓRIA EM CADEIA" (Chain)
+        step = "Análise Contínua";
+        
+        // Focamos nos últimos 15.000 chars para ser relevante, mas processamos em ordem
+        const relevantText = fullText.slice(-15000); 
+        
+        // Pedaços de 1.500 caracteres (seguro para URL)
+        const chunks = splitText(relevantText, 1500);
+        console.log(`[CHAIN] Analisando ${chunks.length} partes em sequência...`);
+
+        // Variável que guarda a "Memória" da IA entre os passos
+        let currentMemory = "Início da análise. Nenhum evento relevante ainda.";
+
+        // Loop Sequencial (Não paralelo, para manter a ordem)
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            const isLast = i === chunks.length - 1;
+            
+            // Para não estourar a URL, cortamos a memória anterior se estiver gigante
+            const safeMemory = currentMemory.length > 500 ? currentMemory.substring(0, 500) + "..." : currentMemory;
+
+            // Se for o último chunk, pedimos o JSON final. Se for meio, pedimos atualização de contexto.
+            const prompt = isLast 
+                ? `Esta é a PARTE FINAL. Baseado na memória anterior e neste texto final, gere o status definitivo. JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico/Neutro", "status_projeto": "Em Dia/Atrasado"}`
+                : `Atualize o cenário. O que aconteceu de novo neste trecho? Mantenha o sentimento atualizado. Seja breve (max 300 chars).`;
+
+            // Chama a IA
+            const response = await axios.get(`${BASE_URL}/openai/question`, {
+                params: {
+                    aiName: 'Roger',
+                    // AQUI ESTÁ O TRUQUE: Passamos o resumo anterior + o novo texto
+                    context: `MEMÓRIA ATÉ AGORA: ${safeMemory}\n\nNOVO TRECHO DA CONVERSA:\n${chunk}`,
+                    question: prompt
+                },
+                headers: { 'Authorization': authHeader }
+            });
+
+            // Atualiza a memória com a resposta da IA para usar no próximo passo
+            currentMemory = response.data.answer || currentMemory;
+            console.log(`[PASSO ${i+1}/${chunks.length}] Memória atualizada.`);
+        }
+
+        // 4. FINALIZAÇÃO
+        step = "Processando Resultado Final";
+        let result = {};
+        
+        // A última resposta da IA (currentMemory) já deve ser o JSON porque o prompt mudou no último passo
+        let finalAnswer = currentMemory.replace(/```json/g, '').replace(/```/g, '').trim();
+
+        try {
+            result = JSON.parse(finalAnswer);
         } catch (e) {
-            console.error("[PARSE ERROR]", answerRaw);
-            result = { resumo: answerRaw.substring(0, 500), status_cliente: "Erro Parse", status_projeto: "Erro Parse" };
+            console.error("[PARSE ERROR]", finalAnswer);
+            // Se falhar o parse, força uma última chamada só para formatar
+            try {
+                const formatResponse = await axios.get(`${BASE_URL}/openai/question`, {
+                    params: {
+                        aiName: 'Roger',
+                        context: `Texto para formatar: ${finalAnswer}`,
+                        question: `Transforme o texto acima neste JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "...", "status_projeto": "..."}`
+                    },
+                    headers: { 'Authorization': authHeader }
+                });
+                const fixedJson = formatResponse.data.answer.replace(/```json/g, '').replace(/```/g, '').trim();
+                result = JSON.parse(fixedJson);
+            } catch (err2) {
+                result = { 
+                    resumo: finalAnswer.substring(0, 500), 
+                    status_cliente: "Erro Parse", 
+                    status_projeto: "Erro Parse" 
+                };
+            }
         }
 
         const updatePayload = {
             doc_link: docUrl,
             resumo: result.resumo,
-            pontos_importantes: result.pontos_importantes || "",
+            pontos_importantes: result.pontos_importantes || "Ver resumo detalhado.",
             status_cliente: result.status_cliente || "Neutro",
             status_projeto: result.status_projeto || "Em Análise",
             last_updated: new Date()
@@ -179,7 +203,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
 module.exports = app;
 
-// --- FRONTEND ---
+// --- FRONTEND (Mantenha igual) ---
 const DASHBOARD_HTML = `
 <!DOCTYPE html>
 <html lang="pt-BR">
