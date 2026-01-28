@@ -29,7 +29,7 @@ app.get('/', (req, res) => {
     res.send(htmlComUrl);
 });
 
-// --- ROTA 2: DADOS DO BANCO ---
+// --- ROTA 2: DADOS ---
 app.get('/api/dashboard-data', async (req, res) => {
     try {
         const { data, error } = await supabase.from('sessoes_resumos').select('*').order('last_updated', { ascending: false });
@@ -40,53 +40,48 @@ app.get('/api/dashboard-data', async (req, res) => {
     }
 });
 
-// --- ROTA 3: SYNC AGENT (CORRIGIDA) ---
+// --- ROTA 3: SYNC AGENT (AJUSTADO PARA GET) ---
 app.get('/api/sync-agent', async (req, res) => {
     let step = "Início";
     try {
         const HEADOFFICE_API_KEY = process.env.HEADOFFICE_API_KEY;
         if (!HEADOFFICE_API_KEY) throw new Error("Falta a HEADOFFICE_API_KEY no .env");
 
-        // PASSO 1: Buscar na Store (Opcional/Verificação)
-        // Corrigido para GET conforme seus parâmetros (search, page, pageSize)
+        // PASSO 1: Buscar na Store (GET)
         step = "Consultando Planilha (/google-sheets/search-store)";
         try {
             await axios.get(`${BASE_URL}/google-sheets/search-store`, {
                 params: {
-                    search: SHEET_ID, // Tentamos achar pelo ID
+                    search: SHEET_ID,
                     page: 1,
                     pageSize: 10
                 },
                 headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` }
             });
-            // Não precisamos fazer nada com o retorno aqui, apenas garantimos que a API sabe que estamos buscando
         } catch (e) {
-            console.warn("Aviso: Falha na busca search-store (pode não ser crítico se tivermos a URL direta).", e.message);
-            // Não damos throw aqui, continuamos para usar a URL direta no passo 2
+            console.warn("Aviso: Falha na busca search-store.", e.message);
         }
 
-        // PASSO 2: Pegar Links da Planilha (Usando URL Direta no Contexto)
+        // PASSO 2: Pegar Links da Planilha (GET)
         step = "Extraindo Links (/openai/question)";
         
-        // Estratégia: Passamos a URL da planilha no contexto. A IA deve acessar e ler.
-        const linksQuery = await axios.post(
-            `${BASE_URL}/openai/question`,
-            { 
-                context: `Aja como um leitor de dados. Acesse esta planilha Google Sheets: ${SHEET_FULL_URL}`,
-                question: `Vá na coluna "Links Docs" (ou Link Docs). Extraia TODAS as URLs de documentos google docs listadas nela. Retorne APENAS um JSON Array de strings puro. Exemplo: ["https://docs...", "https://docs..."]. Não escreva nada além do JSON.`
+        // MUDANÇA CRÍTICA: axios.get com params
+        const linksQuery = await axios.get(`${BASE_URL}/openai/question`, {
+            params: {
+                // Passamos a URL para a IA entender o contexto
+                context: `Planilha Google Sheets: ${SHEET_FULL_URL}`,
+                question: `Liste APENAS as URLs encontradas na coluna "Links Docs". Retorne JSON Array puro: ["url1", "url2"].`
             },
-            { headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` } }
-        );
+            headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` }
+        });
 
         let linksDocs = [];
         const answerText = linksQuery.data.answer || "";
         
         try {
-            // Limpa qualquer formatação markdown (```json ... ```)
             const cleanJson = answerText.replace(/```json/g, '').replace(/```/g, '').trim();
             linksDocs = JSON.parse(cleanJson);
         } catch (e) {
-            // Fallback: Tenta achar URLs via Regex se o JSON falhar
             const urlRegex = /(https?:\/\/[^\s,\]"]+)/g;
             linksDocs = answerText.match(urlRegex) || [];
         }
@@ -94,68 +89,58 @@ app.get('/api/sync-agent', async (req, res) => {
         if (!Array.isArray(linksDocs) || linksDocs.length === 0) {
             return res.json({ 
                 success: false, 
-                message: "A IA acessou a planilha mas não conseguiu extrair links válidos.", 
+                message: "Não foi possível extrair links da planilha.", 
                 debug_ia: answerText 
             });
         }
 
-        // PASSO 3: Ler Conteúdo de Cada Link Encontrado
+        // PASSO 3: Ler Conteúdo de Cada Link (GET)
         step = "Lendo Documentos Individuais";
         const results = [];
 
         for (const link of linksDocs) {
-            // Verifica se já existe no banco (Cache)
             const { data: existing } = await supabase.from('sessoes_resumos').select('id').eq('doc_link', link).single();
             if (existing) continue;
 
             const promptAnalise = `
-                Aja como um Gerente de Projetos Sênior da HeadOffice.
-                Acesse e leia o conteúdo completo deste documento: ${link}
-                (O documento contém histórico de conversas separado por datas).
-
-                TAREFA:
-                1. Identifique a ÚLTIMA data registrada (a conversa mais recente).
-                2. Baseado APENAS nessa última conversa, preencha os dados abaixo.
-                
-                Retorne um JSON estrito:
+                Identifique a ÚLTIMA data/sessão neste documento e resuma.
+                JSON estrito:
                 {
-                    "nome_cliente": "Nome do Cliente identificado",
-                    "resumo_ultima_sessao": "Resumo executivo do que foi tratado na última data",
-                    "pontos_importantes": "Top 3 pontos de atenção ou decisões tomadas",
-                    "status_cliente": "Uma palavra ou frase curta (Ex: Satisfeito, Ansioso, Irritado)",
-                    "status_projeto": "Uma palavra ou frase curta (Ex: Em Dia, Atrasado, Bug Crítico)"
+                    "nome_cliente": "Nome",
+                    "resumo_ultima_sessao": "Resumo",
+                    "pontos_importantes": "Top 3 pontos",
+                    "status_cliente": "Satisfeito/Crítico",
+                    "status_projeto": "Andamento/Atrasado"
                 }
             `;
 
-            const docResponse = await axios.post(
-                `${BASE_URL}/openai/question`,
-                {
-                    context: `Documento alvo: ${link}`,
+            // MUDANÇA CRÍTICA: axios.get com params
+            const docResponse = await axios.get(`${BASE_URL}/openai/question`, {
+                params: {
+                    context: `Link do Documento: ${link}`, // Enviamos o link, a API deve fazer o fetch interno
                     question: promptAnalise
                 },
-                { headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` } }
-            );
+                headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` }
+            });
 
-            // Parse seguro da resposta
             let parsed = {};
             try {
                 const raw = docResponse.data.answer.replace(/```json/g, '').replace(/```/g, '');
                 parsed = JSON.parse(raw);
             } catch (e) {
                 parsed = { 
-                    resumo_ultima_sessao: docResponse.data.answer.substring(0, 300) + "...", 
+                    resumo_ultima_sessao: docResponse.data.answer ? docResponse.data.answer.substring(0, 300) : "Sem resposta da IA", 
                     status_cliente: "Erro Leitura", 
                     status_projeto: "Indefinido",
                     nome_cliente: "Cliente"
                 };
             }
 
-            // Salva no Supabase
             const { data: saved } = await supabase.from('sessoes_resumos').upsert({
                 doc_link: link,
                 nome_cliente: parsed.nome_cliente || "Cliente",
                 resumo_ultima_sessao: parsed.resumo_ultima_sessao,
-                pontos_discussao: parsed.pontos_importantes || "",
+                pontos_discussao: parsed.pontos_discussao || parsed.pontos_importantes || "",
                 status_cliente: parsed.status_cliente || "Neutro",
                 status_projeto: parsed.status_projeto || "Em Análise",
                 last_updated: new Date()
@@ -170,11 +155,11 @@ app.get('/api/sync-agent', async (req, res) => {
         console.error(`Erro no passo [${step}]:`, error.message);
         
         const errorDetail = error.response 
-            ? `Status ${error.response.status}: ${JSON.stringify(error.response.data)}` 
+            ? `Status ${error.response.status} - ${JSON.stringify(error.response.data)}` 
             : error.message;
 
         res.status(500).json({ 
-            error: "Falha no processo do Agente.", 
+            error: "Falha na API HeadOffice.", 
             step_failed: step,
             details: errorDetail
         });
@@ -296,4 +281,3 @@ const DASHBOARD_HTML = `
     </script>
 </body>
 </html>
-`;
