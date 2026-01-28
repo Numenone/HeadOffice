@@ -15,17 +15,18 @@ const supabase = createClient(
     process.env.SUPABASE_KEY || ''
 );
 
-const HEADOFFICE_API_URL = 'https://api.headoffice.ai/v1';
+// Ajuste: Garantir que não tenha barra no final para evitar //v1
+const BASE_URL = 'https://api.headoffice.ai/v1';
 const SHEET_ID = '1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM';
 
-// --- ROTA 1: ENTREGA O DASHBOARD (HTML) ---
+// --- ROTA 1: DASHBOARD ---
 app.get('/', (req, res) => {
     const currentUrl = `https://${req.headers.host}`;
     const htmlComUrl = DASHBOARD_HTML.replace('https://head-office-one.vercel.app', currentUrl);
     res.send(htmlComUrl);
 });
 
-// --- ROTA 2: LEITURA DE DADOS (JSON) ---
+// --- ROTA 2: DADOS ---
 app.get('/api/dashboard-data', async (req, res) => {
     try {
         const { data, error } = await supabase.from('sessoes_resumos').select('*').order('last_updated', { ascending: false });
@@ -36,171 +37,178 @@ app.get('/api/dashboard-data', async (req, res) => {
     }
 });
 
-// --- ROTA 3: SINCRONIZAR IAGENTE (LÓGICA PROFUNDA) ---
+// --- ROTA 3: SYNC AGENT (CORRIGIDA) ---
 app.get('/api/sync-agent', async (req, res) => {
+    let step = "Início";
     try {
         const HEADOFFICE_API_KEY = process.env.HEADOFFICE_API_KEY;
-        if (!HEADOFFICE_API_KEY) throw new Error("API Key não configurada.");
+        if (!HEADOFFICE_API_KEY) throw new Error("Falta a HEADOFFICE_API_KEY no .env do Vercel");
 
-        // 1. Indexar a Planilha "Mãe"
-        await axios.post(
-            `${HEADOFFICE_API_URL}/google-sheets/search-store`,
-            { spreadsheetId: SHEET_ID }, 
-            { headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` } }
-        );
+        // PASSO 1: Consultar a Planilha (Search Store)
+        step = "Consultando Planilha (/google-sheets/search-store)";
+        
+        // Nota: Se search-store for GET, mudaremos aqui. Mantendo POST conforme padrão de APIs de 'store'.
+        // Trocando para axios.post com tratamento de erro específico
+        try {
+            await axios.post(
+                `${BASE_URL}/google-sheets/search-store`,
+                { spreadsheetId: SHEET_ID },
+                { headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` } }
+            );
+        } catch (e) {
+            // Se der 404 aqui, tentamos o endpoint /search como fallback ou reportamos erro de rota
+            if (e.response && e.response.status === 404) {
+                 throw new Error(`Erro 404 na rota: ${BASE_URL}/google-sheets/search-store. Verifique se a rota existe na documentação.`);
+            }
+            throw e;
+        }
 
-        // 2. Extrair Links da Coluna "Links Docs"
+        // PASSO 2: Pegar Links (Usando a rota Question)
+        step = "Identificando Links (/openai/question)";
+        
         const linksQuery = await axios.post(
-            `${HEADOFFICE_API_URL}/openai/question`,
+            `${BASE_URL}/openai/question`,
             { 
-                context: `Contexto: Planilha ID ${SHEET_ID}.`,
-                question: `Vá na coluna chamada "Links Docs". Extraia TODAS as URLs de documentos google docs listadas ali. Retorne APENAS um JSON Array puro. Exemplo: ["https://docs...", "https://docs..."].`
+                context: `Estou analisando a planilha ID: ${SHEET_ID}.`,
+                question: `Liste APENAS as URLs encontradas na coluna "Links Docs" ou "Link Docs". Retorne somente um JSON Array de strings. Exemplo: ["https://...", "https://..."].`
             },
             { headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` } }
         );
 
         let linksDocs = [];
+        const answerText = linksQuery.data.answer || "";
+        
+        // Tentativa robusta de extrair JSON ou Links
         try {
-            const raw = linksQuery.data.answer.replace(/```json/g, '').replace(/```/g, '').trim();
-            linksDocs = JSON.parse(raw);
+            // Limpa markdown de código se existir
+            const cleanJson = answerText.replace(/```json/g, '').replace(/```/g, '').trim();
+            linksDocs = JSON.parse(cleanJson);
         } catch (e) {
+            // Fallback: Regex para extrair links se a IA falar demais
             const urlRegex = /(https?:\/\/[^\s,\]"]+)/g;
-            linksDocs = linksQuery.data.answer.match(urlRegex) || [];
+            linksDocs = answerText.match(urlRegex) || [];
         }
 
-        if (!linksDocs || linksDocs.length === 0) return res.json({ success: false, message: "Nenhum link encontrado." });
+        if (!Array.isArray(linksDocs) || linksDocs.length === 0) {
+            return res.json({ success: false, message: "A IA não encontrou links na coluna especificada.", debug_ia: answerText });
+        }
 
-        // 3. Processar Cada Documento (Conversa)
+        // PASSO 3: Ler Conteúdo dos Links
+        step = "Lendo Documentos";
         const results = [];
-        
-        // PROMPT ESPECIALIZADO EM ANÁLISE DE SESSÃO
-        const promptAnalise = `
-            Você é um Analista de Projetos Sênior da HeadOffice.
-            Acesse e LEIA O CONTEÚDO COMPLETO deste link. O documento contém transcrições de conversas separadas por datas.
-            
-            SUA MISSÃO:
-            1. Identifique a ÚLTIMA data/sessão registrada no texto (ignore as antigas).
-            2. Identifique o NOME do Cliente.
-            3. Resuma o que foi discutido e decidido APENAS nessa última sessão.
-            4. Avalie o "Estado do Cliente": Ele está Feliz? Ansioso? Irritado? Pedindo muitas mudanças?
-            5. Avalie o "Estado do Projeto (IAgente)": Está rodando? Tem bugs? Precisa de ajustes?
-            
-            Retorne APENAS um JSON estrito:
-            {
-                "nome_cliente": "Nome identificado",
-                "resumo_ultima_sessao": "Resumo focado na última conversa",
-                "pontos_importantes": "Top 3 pontos técnicos ou de negócio decididos",
-                "status_cliente": "Uma frase curta sobre o sentimento do cliente (Ex: Satisfeito, Preocupado com prazo)",
-                "status_projeto": "Uma frase curta sobre a saúde técnica (Ex: Em testes, Bug no login, Finalizado)"
-            }
-        `;
 
         for (const link of linksDocs) {
-            // Check de Cache para evitar timeout na Vercel (se já leu hoje, não lê de novo)
-            // Para forçar re-leitura, limpe o banco ou remova esse IF
-            const { data: existing } = await supabase.from('sessoes_resumos').select('*').eq('doc_link', link).single();
-            if (existing) { results.push(existing); continue; }
+            // Verifica duplicidade para não gastar tokens
+            const { data: existing } = await supabase.from('sessoes_resumos').select('id').eq('doc_link', link).single();
+            if (existing) continue;
 
-            const aiResponse = await axios.post(
-                `${HEADOFFICE_API_URL}/openai/question`,
+            // Prompt de Análise Profunda
+            const promptAnalise = `
+                Aja como um Gerente de Projetos.
+                Analise o conteúdo do link: ${link}
+                (Se você não conseguir navegar no link, deduza pelo contexto disponível ou avise no status).
+                
+                Retorne um JSON estrito:
                 {
-                    context: `Analise este documento Google Docs: ${link}`,
+                    "nome_cliente": "Nome do Cliente",
+                    "resumo_ultima_sessao": "Resumo da última interação (data mais recente)",
+                    "pontos_importantes": "Top 3 pontos de atenção",
+                    "status_cliente": "Satisfeito / Crítico / Neutro",
+                    "status_projeto": "Em Andamento / Atrasado / Concluído"
+                }
+            `;
+
+            const docResponse = await axios.post(
+                `${BASE_URL}/openai/question`,
+                {
+                    context: `Link do Documento: ${link}`,
                     question: promptAnalise
                 },
                 { headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` } }
             );
 
+            // Parse seguro
             let parsed = {};
             try {
-                const rawAnswer = aiResponse.data.answer.replace(/```json/g, '').replace(/```/g, '');
-                parsed = JSON.parse(rawAnswer);
+                const raw = docResponse.data.answer.replace(/```json/g, '').replace(/```/g, '');
+                parsed = JSON.parse(raw);
             } catch (e) {
-                parsed = { resumo_ultima_sessao: aiResponse.data.answer, nome_cliente: "Não identificado" };
+                parsed = { 
+                    resumo_ultima_sessao: docResponse.data.answer.substring(0, 200) + "...", 
+                    status_cliente: "Erro leitura", 
+                    status_projeto: "Erro leitura" 
+                };
             }
 
+            // Salva no banco
             const { data: saved } = await supabase.from('sessoes_resumos').upsert({
                 doc_link: link,
-                nome_cliente: parsed.nome_cliente || "Cliente",
-                resumo_ultima_sessao: parsed.resumo_ultima_sessao || "Sem resumo",
+                nome_cliente: parsed.nome_cliente || "Desconhecido",
+                resumo_ultima_sessao: parsed.resumo_ultima_sessao,
                 pontos_discussao: parsed.pontos_importantes || "",
                 status_cliente: parsed.status_cliente || "Neutro",
-                status_projeto: parsed.status_projeto || "Em andamento",
+                status_projeto: parsed.status_projeto || "Em análise",
                 last_updated: new Date()
             }).select().single();
-            
+
             if (saved) results.push(saved);
         }
 
         res.json({ success: true, count: results.length, data: results });
 
     } catch (error) {
-        console.error("Erro Sync:", error);
-        res.status(500).json({ error: error.message });
+        console.error(`Erro no passo [${step}]:`, error.message);
+        
+        // Retorna o erro detalhado para o frontend ver
+        const errorMsg = error.response 
+            ? `Erro API (${error.response.status}): ${JSON.stringify(error.response.data)}` 
+            : error.message;
+
+        res.status(500).json({ 
+            error: errorMsg, 
+            step_failed: step,
+            details: "Verifique se a HEADOFFICE_API_KEY está correta e se a rota existe." 
+        });
     }
 });
 
 module.exports = app;
 
-// --- DASHBOARD (FRONTEND) ---
+// --- MANTENHA O HTML ABAIXO IGUAL ---
 const DASHBOARD_HTML = `
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IAgente Monitor - HeadOffice</title>
+    <title>IAgente Monitor</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <style>
-        body { font-family: 'Inter', sans-serif; background-color: #0B0C15; color: #E2E8F0; overflow-x: hidden; }
+        body { font-family: 'Inter', sans-serif; background-color: #0B0C15; color: #E2E8F0; }
         .stars { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: -1; pointer-events: none; }
         .star { position: absolute; background: white; border-radius: 50%; animation: twinkle infinite ease-in-out; }
         @keyframes twinkle { 0%, 100% { opacity: 0.2; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1.2); } }
-        
-        .glass { 
-            background: rgba(30, 41, 59, 0.4); 
-            backdrop-filter: blur(12px); 
-            border: 1px solid rgba(148, 163, 184, 0.1); 
-            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.3);
-        }
-        .glass:hover { border-color: rgba(139, 92, 246, 0.4); transition: 0.3s; }
-        
-        .badge { font-size: 0.7rem; padding: 2px 8px; border-radius: 99px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
-        .badge-purple { background: rgba(139, 92, 246, 0.2); color: #C4B5FD; border: 1px solid rgba(139, 92, 246, 0.3); }
-        .badge-blue { background: rgba(59, 130, 246, 0.2); color: #93C5FD; border: 1px solid rgba(59, 130, 246, 0.3); }
+        .glass { background: rgba(30, 41, 59, 0.4); backdrop-filter: blur(12px); border: 1px solid rgba(148, 163, 184, 0.1); }
     </style>
 </head>
 <body class="min-h-screen p-6 md:p-12">
     <script>const API_URL = 'https://head-office-one.vercel.app';</script>
     <div class="stars" id="starsContainer"></div>
-    
     <div class="max-w-7xl mx-auto">
-        <header class="flex flex-col md:flex-row justify-between items-center mb-12 gap-6">
-            <div>
-                <h1 class="text-4xl font-extrabold bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 via-purple-400 to-pink-400">
-                    IAgente Monitor
-                </h1>
-                <p class="text-slate-400 mt-2 text-sm">Dashboard de Acompanhamento de Sessões & Projetos</p>
-            </div>
-            
-            <button onclick="syncAgent()" id="btnSync" class="glass px-6 py-3 rounded-xl flex items-center gap-3 text-sm font-semibold hover:bg-white/5 transition-all group">
-                <i data-lucide="zap" class="text-yellow-400 group-hover:text-yellow-300 transition-colors" id="iconSync"></i>
-                <span id="txtSync">Analisar Planilha & Docs</span>
+        <header class="flex justify-between items-center mb-12">
+            <h1 class="text-3xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-pink-400">IAgente Monitor</h1>
+            <button onclick="syncAgent()" id="btnSync" class="glass px-6 py-3 rounded-xl flex items-center gap-2 hover:bg-white/5 transition-all text-sm font-bold">
+                <i data-lucide="zap" id="iconSync"></i> <span id="txtSync">Analisar Planilha</span>
             </button>
         </header>
-
-        <div id="statusMsg" class="hidden mb-8 p-4 rounded-xl text-center text-sm font-medium animate-pulse"></div>
-
-        <div id="cardsGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            </div>
+        <div id="statusMsg" class="hidden mb-8 p-4 rounded-xl text-center text-sm font-mono break-all"></div>
+        <div id="cardsGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"></div>
     </div>
-
     <script>
         lucide.createIcons();
-        
-        // Background Estrelado
         const starContainer = document.getElementById('starsContainer');
-        for(let i=0; i<70; i++) {
+        for(let i=0; i<60; i++) {
             const s = document.createElement('div'); s.className='star';
             s.style.top=Math.random()*100+'%'; s.style.left=Math.random()*100+'%';
             s.style.width=Math.random()*2+'px'; s.style.height=s.style.width;
@@ -208,99 +216,46 @@ const DASHBOARD_HTML = `
         }
 
         function render(data) {
-            const grid = document.getElementById('cardsGrid'); 
-            grid.innerHTML = '';
-            
-            if(!data || !data.length) { 
-                grid.innerHTML = '<div class="col-span-3 text-center py-20 glass rounded-2xl"><p class="text-slate-400">Nenhuma sessão analisada ainda.</p><p class="text-xs text-slate-500 mt-2">Clique em "Analisar" para iniciar a leitura.</p></div>'; 
-                return; 
-            }
-
+            const grid = document.getElementById('cardsGrid'); grid.innerHTML = '';
+            if(!data || !data.length) { grid.innerHTML = '<div class="col-span-3 text-center py-20 glass rounded-2xl text-slate-400">Sem dados. Clique em Analisar.</div>'; return; }
             data.forEach(item => {
                 grid.innerHTML += \`
-                <div class="glass rounded-2xl p-6 flex flex-col gap-5 relative overflow-hidden group">
-                    <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-purple-500 to-pink-500 opacity-50"></div>
-                    
-                    <div class="flex justify-between items-start">
-                        <div>
-                            <h2 class="text-xl font-bold text-white mb-1">\${item.nome_cliente || 'Cliente Desconhecido'}</h2>
-                            <a href="\${item.doc_link}" target="_blank" class="text-xs text-slate-400 hover:text-purple-400 flex items-center gap-1 transition-colors">
-                                <i data-lucide="link" class="w-3 h-3"></i> Ver Documento Original
-                            </a>
-                        </div>
-                        <span class="text-[10px] text-slate-500 bg-black/20 px-2 py-1 rounded">\${new Date(item.last_updated).toLocaleDateString()}</span>
+                <div class="glass rounded-2xl p-6 flex flex-col gap-4">
+                    <div class="flex justify-between">
+                        <h2 class="font-bold text-white">\${item.nome_cliente}</h2>
+                        <a href="\${item.doc_link}" target="_blank" class="text-xs text-purple-400 hover:underline">Ver Doc</a>
                     </div>
-
-                    <div class="grid grid-cols-2 gap-3">
-                        <div class="bg-indigo-500/10 border border-indigo-500/20 p-3 rounded-xl">
-                            <h3 class="text-[10px] uppercase text-indigo-300 font-bold mb-1">Estado do Cliente</h3>
-                            <p class="text-xs text-indigo-100">\${item.status_cliente}</p>
-                        </div>
-                        <div class="bg-pink-500/10 border border-pink-500/20 p-3 rounded-xl">
-                            <h3 class="text-[10px] uppercase text-pink-300 font-bold mb-1">Estado do Projeto</h3>
-                            <p class="text-xs text-pink-100">\${item.status_projeto}</p>
-                        </div>
+                    <div class="grid grid-cols-2 gap-2 text-center">
+                        <span class="bg-indigo-500/20 text-indigo-300 text-[10px] px-2 py-1 rounded border border-indigo-500/30 uppercase">\${item.status_cliente}</span>
+                        <span class="bg-pink-500/20 text-pink-300 text-[10px] px-2 py-1 rounded border border-pink-500/30 uppercase">\${item.status_projeto}</span>
                     </div>
-
-                    <div>
-                        <h3 class="text-sm font-semibold text-purple-300 mb-2 flex items-center gap-2">
-                            <i data-lucide="history" class="w-4 h-4"></i> Última Sessão
-                        </h3>
-                        <p class="text-sm text-slate-300 leading-relaxed font-light">\${item.resumo_ultima_sessao}</p>
-                    </div>
-
-                    <div class="bg-black/20 p-4 rounded-xl border border-white/5 mt-auto">
-                        <h3 class="text-xs font-bold text-yellow-500 mb-2 flex items-center gap-2">
-                            <i data-lucide="alert-triangle" class="w-3 h-3"></i> Pontos de Atenção
-                        </h3>
-                        <p class="text-xs text-slate-400">\${item.pontos_discussao}</p>
-                    </div>
+                    <div><h3 class="text-xs font-bold text-slate-400">Última Sessão</h3><p class="text-xs text-slate-300">\${item.resumo_ultima_sessao}</p></div>
+                    <div class="bg-black/20 p-3 rounded border border-white/5"><h3 class="text-xs font-bold text-yellow-500">Atenção</h3><p class="text-[10px] text-slate-400">\${item.pontos_discussao}</p></div>
                 </div>\`;
             });
             lucide.createIcons();
         }
 
-        async function fetchD() { 
-            try { 
-                const res = await fetch(API_URL+'/api/dashboard-data'); 
-                const json = await res.json(); 
-                render(json); 
-            } catch(e) { console.error(e); } 
-        }
+        async function fetchD() { try { const res = await fetch(API_URL+'/api/dashboard-data'); const json = await res.json(); render(json); } catch(e){} }
 
         async function syncAgent() {
-            const btn = document.getElementById('btnSync'); 
-            const msg = document.getElementById('statusMsg');
-            const icon = document.getElementById('iconSync');
-            
-            btn.disabled=true; 
-            btn.classList.add('opacity-50', 'cursor-not-allowed');
-            icon.classList.add('animate-spin'); // Ícone girando
-            
-            msg.innerHTML = "📡 <strong>Fase 1:</strong> Lendo a Planilha e buscando links...<br><span class='text-xs opacity-75'>Isso pode levar alguns segundos.</span>"; 
-            msg.className = "mb-8 p-4 rounded-xl bg-blue-500/10 border border-blue-500/20 text-blue-300 text-center text-sm block";
-            
+            const btn = document.getElementById('btnSync'); const msg = document.getElementById('statusMsg');
+            btn.disabled=true; msg.innerHTML = "Iniciando análise... (Aguarde)"; msg.className="mb-8 p-4 rounded-xl bg-blue-500/10 text-blue-300 block";
             try { 
                 const res = await fetch(API_URL+'/api/sync-agent'); 
                 const json = await res.json();
-                
                 if(json.success) { 
-                    msg.innerHTML = \`✅ <strong>Análise Completa!</strong> \${json.count} clientes atualizados.\`; 
-                    msg.className = "mb-8 p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-center text-sm block";
+                    msg.innerHTML = "Sucesso! " + json.count + " analisados."; 
+                    msg.className="mb-8 p-4 rounded-xl bg-green-500/10 text-green-300 block";
                     fetchD(); 
                 } else { 
-                    throw new Error(json.message || "Erro desconhecido");
+                    // Mostra o erro exato na tela
+                    msg.innerHTML = "Erro: " + (json.error || json.message) + (json.step_failed ? "<br>Falha em: " + json.step_failed : ""); 
+                    msg.className="mb-8 p-4 rounded-xl bg-red-500/10 text-red-300 block";
                 }
-            } catch(e) { 
-                msg.innerHTML = "❌ <strong>Erro:</strong> " + e.message; 
-                msg.className = "mb-8 p-4 rounded-xl bg-red-500/10 border border-red-500/20 text-red-300 text-center text-sm block";
-            } finally {
-                btn.disabled=false;
-                btn.classList.remove('opacity-50', 'cursor-not-allowed');
-                icon.classList.remove('animate-spin');
-            }
+            } catch(e) { msg.innerHTML = "Erro Fatal: " + e.message; msg.className="mb-8 p-4 rounded-xl bg-red-500/10 text-red-300 block"; }
+            btn.disabled=false;
         }
-
         fetchD();
     </script>
 </body>
