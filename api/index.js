@@ -16,7 +16,6 @@ const supabase = createClient(
 );
 
 const BASE_URL = 'https://api.headoffice.ai/v1';
-// ID da planilha extraído do link
 const SHEET_ID = '1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM';
 const SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=0`;
 const SHEET_FULL_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`;
@@ -41,118 +40,104 @@ app.post('/api/empresas', async (req, res) => {
     res.json({ success: true, data });
 });
 
-// --- ROTA DE RESUMO HÍBRIDA ---
+// --- ROTA DE RESUMO (LEITURA DIRETA) ---
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     
-    // --- TRATAMENTO DE TOKEN ---
-    // (Mantemos a lógica de emergência caso precise)
+    // Tratamento de Token
     const TOKEN_DE_EMERGENCIA = ""; 
-    
     let rawToken = TOKEN_DE_EMERGENCIA || process.env.HEADOFFICE_JWT || "";
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
+    if (rawToken.toLowerCase().startsWith('bearer ')) rawToken = rawToken.substring(7).trim();
     
-    // Remove "Bearer" se existir, pois a API quer só o token
-    if (rawToken.toLowerCase().startsWith('bearer ')) {
-        rawToken = rawToken.substring(7).trim();
-    }
-    
-    // Se o token for curto demais, nem tenta
-    if (rawToken.length < 20) {
-        return res.status(500).json({ error: "Token JWT não configurado ou inválido." });
-    }
+    const authHeader = rawToken;
 
-    const authHeader = rawToken; // Token puro
+    if (rawToken.length < 20) return res.status(500).json({ error: "Token JWT inválido." });
 
     let step = "Início";
     let docUrl = null;
 
     try {
-        // ==========================================================
-        // TENTATIVA 1: BUSCA RÁPIDA VIA CSV (Sem gastar IA)
-        // ==========================================================
-        step = "Baixando CSV (Tentativa 1)";
+        // PASSO 1: Encontrar Link (CSV ou IA)
+        step = "Baixando CSV";
         try {
             const csvResponse = await axios.get(SHEET_CSV_URL);
             const lines = csvResponse.data.split('\n');
-            
             for (const line of lines) {
                 if (line.toLowerCase().includes(nome.toLowerCase())) {
-                    // Regex mais permissiva para pegar links do Docs
                     const match = line.match(/(https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+)/);
-                    if (match) {
-                        docUrl = match[0];
-                        console.log(`[CSV] Link encontrado para ${nome}: ${docUrl}`);
-                        break;
-                    }
+                    if (match) { docUrl = match[0]; break; }
                 }
             }
-        } catch (csvError) {
-            console.warn("[CSV] Falha ao baixar ou processar CSV. Tentando via IA.");
-        }
+        } catch (e) { console.warn("CSV falhou."); }
 
-        // ==========================================================
-        // TENTATIVA 2: BUSCA VIA IA (Se o CSV falhou)
-        // ==========================================================
         if (!docUrl) {
-            step = "Perguntando para a IA (Tentativa 2)";
-            console.log(`[IA] CSV falhou para ${nome}. Perguntando à HeadOffice...`);
-            
+            step = "Perguntando à IA (Fallback Link)";
             const aiSearch = await axios.get(`${BASE_URL}/openai/question`, {
                 params: {
                     aiName: 'Roger', 
-                    context: `Analise a planilha: ${SHEET_FULL_URL}`,
-                    // Pergunta específica para forçar a IA a caçar o link
-                    question: `Encontre a linha da empresa "${nome}". Extraia a URL do Google Docs que está na coluna "Links Docs" (mesmo se for um hyperlink). Retorne APENAS a URL.`
+                    context: `Planilha: ${SHEET_FULL_URL}`,
+                    question: `Encontre a empresa "${nome}". Extraia a URL do Google Docs (Link Docs). Retorne APENAS a URL.`
                 },
                 headers: { 'Authorization': authHeader }
             });
-
             const answerAI = aiSearch.data.answer || "";
             const matchAI = answerAI.match(/(https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+)/);
-            
-            if (matchAI) {
-                docUrl = matchAI[0];
-                console.log(`[IA] Link encontrado: ${docUrl}`);
-            } else {
-                return res.json({ 
-                    success: false, 
-                    error: `Link não encontrado nem no CSV nem pela IA. Verifique se o nome "${nome}" está correto na planilha.` 
-                });
-            }
+            if (matchAI) docUrl = matchAI[0];
         }
 
-        // ==========================================================
-        // PASSO FINAL: RESUMIR O DOCUMENTO ENCONTRADO
-        // ==========================================================
-        step = `Lendo Documento: ${docUrl}`;
+        if (!docUrl) return res.json({ success: false, error: `Link não encontrado para ${nome}.` });
+
+        // PASSO 2: LEITURA DIRETA DO CONTEÚDO (O Pulo do Gato)
+        step = `Baixando Texto do Doc`;
+        const txtUrl = `${docUrl}/export?format=txt`;
+        let docContent = "";
+
+        try {
+            // O próprio backend baixa o texto agora
+            const textResponse = await axios.get(txtUrl);
+            docContent = typeof textResponse.data === 'string' ? textResponse.data : JSON.stringify(textResponse.data);
+
+            // Verificação de Segurança: Se retornou HTML, é porque pediu login
+            if (docContent.includes("<!DOCTYPE html>") || docContent.includes("Google Accounts")) {
+                return res.json({ 
+                    success: false, 
+                    error: "O Google Docs bloqueou o acesso. Verifique se o DOCUMENTO (não só a planilha) está público para 'Qualquer pessoa com o link'." 
+                });
+            }
+        } catch (downloadError) {
+            return res.json({ success: false, error: "Falha ao baixar o texto do documento. O link pode estar quebrado ou privado." });
+        }
+
+        // Limita o tamanho do texto para não estourar a memória da IA (aprox 20k caracteres)
+        const truncatedContent = docContent.substring(docContent.length - 20000); // Pega o final (últimas sessões)
+
+        // PASSO 3: Resumir (Enviando o TEXTO, não o link)
+        step = "Enviando Texto para IA";
         
         const summaryResponse = await axios.get(`${BASE_URL}/openai/question`, {
             params: {
                 aiName: 'Roger',
-                context: `Documento: ${docUrl}`,
-                question: `Aja como Gerente de Projetos. Leia a ÚLTIMA sessão registrada (data mais recente). Retorne JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico/Neutro", "status_projeto": "Em Dia/Atrasado"}`
+                // AQUI ESTÁ A MÁGICA: Enviamos o conteúdo direto
+                context: `Conteúdo da Transcrição (Final do arquivo):\n${truncatedContent}`,
+                question: `Aja como Gerente de Projetos. Analise a transcrição. Identifique a ÚLTIMA data/sessão. Resuma o status.
+                Retorne JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico/Neutro", "status_projeto": "Em Dia/Atrasado"}`
             },
             headers: { 'Authorization': authHeader }
         });
 
-        // Tratamento do JSON
+        // Tratamento
         let result = {};
-        const answerRaw = summaryResponse.data.answer || "";
+        let answerRaw = summaryResponse.data.answer || "";
+        answerRaw = answerRaw.replace(/```json/g, '').replace(/```/g, '').trim();
         
         try {
-            const cleanJson = answerRaw.replace(/```json/g, '').replace(/```/g, '').trim();
-            result = JSON.parse(cleanJson);
+            result = JSON.parse(answerRaw);
         } catch (e) {
-            result = { 
-                resumo: answerRaw.substring(0, 500), 
-                status_cliente: "Erro Parse", 
-                status_projeto: "Erro Parse" 
-            };
+            result = { resumo: answerRaw.substring(0, 500), status_cliente: "Erro Parse", status_projeto: "Erro Parse" };
         }
 
-        // Salvar no Supabase
         const updatePayload = {
             doc_link: docUrl,
             resumo: result.resumo,
@@ -163,27 +148,18 @@ app.post('/api/resumir-empresa', async (req, res) => {
         };
 
         await supabase.from('empresas').update(updatePayload).eq('id', id);
-
         res.json({ success: true, data: updatePayload });
 
     } catch (error) {
-        console.error(`[ERRO] Passo: ${step}`, error.message);
-        
-        const errorDetail = error.response && error.response.data 
-            ? JSON.stringify(error.response.data)
-            : error.message;
-
-        res.status(500).json({ 
-            error: "Falha no processamento", 
-            step, 
-            details: errorDetail 
-        });
+        console.error(`[ERRO] ${step}:`, error.message);
+        const errorDetail = error.response ? JSON.stringify(error.response.data) : error.message;
+        res.status(500).json({ error: "Falha técnica", step, details: errorDetail });
     }
 });
 
 module.exports = app;
 
-// --- FRONTEND ---
+// --- FRONTEND (Mantenha igual) ---
 const DASHBOARD_HTML = `
 <!DOCTYPE html>
 <html lang="pt-BR">
