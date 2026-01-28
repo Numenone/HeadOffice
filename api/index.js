@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
-const { google } = require('googleapis'); // BIBLIOTECA OFICIAL
+const { google } = require('googleapis');
 
 const app = express();
 
@@ -37,19 +37,52 @@ function getHeadOfficeToken() {
     let rawToken = process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
+    if (rawToken.toLowerCase().startsWith('bearer ')) rawToken = rawToken.substring(7).trim();
     return rawToken.length > 10 ? rawToken : null;
 }
 
-// --- HELPER GOOGLE DOCS (SERVICE ACCOUNT) ---
+// --- HELPER: EXTRATOR UNIVERSAL DO GOOGLE DOCS ---
+// Essa função recursiva lê texto dentro de Parágrafos, Tabelas, Listas, Rodapés, etc.
+function readStructuralElements(elements) {
+    let text = '';
+    if (!elements) return text;
+
+    elements.forEach(element => {
+        // 1. Texto Normal (Paragraph)
+        if (element.paragraph) {
+            element.paragraph.elements.forEach(el => {
+                if (el.textRun && el.textRun.content) {
+                    text += el.textRun.content;
+                }
+            });
+        }
+        // 2. Tabelas (Table) - Comum em templates
+        else if (element.table) {
+            element.table.tableRows.forEach(row => {
+                row.tableCells.forEach(cell => {
+                    // Recursividade: Uma célula contém "content" que são structural elements
+                    text += readStructuralElements(cell.content) + " | "; 
+                });
+                text += "\n"; // Quebra de linha por linha da tabela
+            });
+        }
+        // 3. Tabela de Conteúdo (TableOfContents)
+        else if (element.tableOfContents) {
+            text += readStructuralElements(element.tableOfContents.content);
+        }
+    });
+    return text;
+}
+
+// --- FUNÇÃO PRINCIPAL GOOGLE DOCS ---
 async function getGoogleDocContent(docId) {
     try {
-        // Formata a chave privada (corrige quebras de linha da Vercel)
         const privateKey = process.env.GOOGLE_PRIVATE_KEY 
             ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') 
             : undefined;
 
         if (!privateKey || !process.env.GOOGLE_CLIENT_EMAIL) {
-            throw new Error("Credenciais do Google (Service Account) não configuradas na Vercel.");
+            throw new Error("Credenciais GCP ausentes (GOOGLE_CLIENT_EMAIL/PRIVATE_KEY).");
         }
 
         const auth = new google.auth.GoogleAuth({
@@ -63,33 +96,22 @@ async function getGoogleDocContent(docId) {
         const client = await auth.getClient();
         const docs = google.docs({ version: 'v1', auth: client });
 
+        console.log(`[GCP] Baixando Doc ID: ${docId}`);
         const res = await docs.documents.get({ documentId: docId });
-        const content = res.data.body.content;
-
-        // Extrai texto puro da estrutura JSON do Google
-        let fullText = '';
-        content.forEach(element => {
-            if (element.paragraph) {
-                element.paragraph.elements.forEach(el => {
-                    if (el.textRun) {
-                        fullText += el.textRun.content;
-                    }
-                });
-            }
-        });
-
+        
+        // Usa o extrator universal
+        const fullText = readStructuralElements(res.data.body.content);
+        
+        console.log(`[GCP] Texto extraído com sucesso: ${fullText.length} caracteres.`);
         return fullText;
 
     } catch (error) {
-        if (error.code === 403 || (error.response && error.response.status === 403)) {
-            throw new Error(`PERMISSÃO NEGADA. Você compartilhou o Doc com o e-mail do robô? (${process.env.GOOGLE_CLIENT_EMAIL})`);
-        }
-        if (error.code === 404) throw new Error("Documento não encontrado (404). Verifique o Link.");
+        if (error.code === 403) throw new Error(`Permissão negada. Compartilhe o doc com: ${process.env.GOOGLE_CLIENT_EMAIL}`);
         throw error;
     }
 }
 
-// --- HELPER TEXT SPLIT ---
+// --- HELPERS ÚTEIS ---
 function splitText(text, chunkSize) {
     const chunks = [];
     for (let i = 0; i < text.length; i += chunkSize) {
@@ -98,7 +120,6 @@ function splitText(text, chunkSize) {
     return chunks;
 }
 
-// --- HELPER JSON PARSE ---
 function extractJSON(text) {
     if (!text) return null;
     const start = text.indexOf('{');
@@ -109,7 +130,7 @@ function extractJSON(text) {
     return text;
 }
 
-// --- ROTAS CRUD EMPRESAS ---
+// --- ROTAS CRUD ---
 app.get('/api/empresas', async (req, res) => {
     const { data, error } = await supabase.from('empresas').select('*').order('nome', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
@@ -125,7 +146,7 @@ app.post('/api/empresas', async (req, res) => {
 });
 
 // ======================================================
-// LÓGICA DE INTELIGÊNCIA ARTIFICIAL (CS INTELLIGENCE V3)
+// LÓGICA DE INTELIGÊNCIA ARTIFICIAL (CS INTELLIGENCE V4)
 // ======================================================
 
 app.post('/api/resumir-empresa', async (req, res) => {
@@ -139,7 +160,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
     let docId = null;
 
     try {
-        // 1. Encontrar Link no CSV
+        // 1. Encontrar Link
         step = "Buscando Link no CSV";
         try {
             const csvResponse = await axios.get(SHEET_CSV_URL);
@@ -156,31 +177,28 @@ app.post('/api/resumir-empresa', async (req, res) => {
             }
         } catch (e) { console.warn("CSV falhou."); }
 
-        if (!docUrl) return res.json({ success: false, error: `Link não encontrado na planilha para ${nome}.` });
+        if (!docUrl) return res.json({ success: false, error: `Link não encontrado na planilha.` });
 
-        // 2. Extração via OAUTH SERVICE ACCOUNT
-        step = `Lendo Google Docs (Service Account)`;
+        // 2. Extração Robusta (Service Account)
+        step = `Lendo Google Docs (GCP)`;
         let fullText = "";
         
         try {
             fullText = await getGoogleDocContent(docId);
             
-            if (!fullText || fullText.trim().length < 20) {
-                return res.json({ success: false, error: "O documento está vazio. A IA não tem o que ler." });
+            if (!fullText || fullText.trim().length < 10) {
+                return res.json({ success: false, error: "Doc acessado, mas parece vazio. Verifique se o texto está dentro de desenhos ou imagens (não suportado)." });
             }
         } catch (apiError) {
             console.error("Erro GCP:", apiError.message);
-            return res.json({ 
-                success: false, 
-                error: apiError.message 
-            });
+            return res.json({ success: false, error: apiError.message });
         }
 
-        // 3. ANÁLISE PROFUNDA (CHAIN)
+        // 3. Chain of Density (AI)
         step = "Processamento Neural CS";
-        const relevantText = fullText.slice(-25000); // 25k chars
-        const chunks = splitText(relevantText, 3500); // 3.5k chars por chunk
-        console.log(`[CHAIN] Processando ${chunks.length} blocos.`);
+        const relevantText = fullText.slice(-25000); 
+        const chunks = splitText(relevantText, 3500); 
+        console.log(`[CHAIN] Analisando ${chunks.length} blocos.`);
 
         let currentMemory = "";
 
@@ -189,25 +207,24 @@ app.post('/api/resumir-empresa', async (req, res) => {
             const isLast = i === chunks.length - 1;
             const safeMemory = currentMemory.length > 2000 ? currentMemory.substring(0, 2000) + "..." : currentMemory;
 
-            // --- PROMPT CS SÊNIOR (ANTI-ALUCINAÇÃO) ---
             const prompt = isLast 
-                ? `ATUE COMO UM SÊNIOR CUSTOMER SUCCESS MANAGER.
-                   Analise o texto real da transcrição abaixo.
+                ? `VOCÊ É UM DIRETOR DE CUSTOMER SUCCESS.
+                   Analise os dados abaixo (extraídos de tabelas e textos do doc).
                    
-                   🚨 REGRA: USE APENAS FATOS DO TEXTO. Se não houver informação, escreva "Não mencionado".
+                   🚨 DADOS REAIS APENAS. Se o doc for um template vazio, diga "Sem dados preenchidos".
 
-                   Gere um Relatório JSON estrito:
+                   Gere JSON estrito:
                    {
-                      "resumo_executivo": "Resumo situacional. Use nomes e fatos citados.",
-                      "perfil_cliente": "Análise comportamental do cliente baseada na fala dele.",
-                      "estrategia_relacionamento": "Ação recomendada para o CS (Ex: Acalmar cliente, Cobrar feedback).",
-                      "checkpoints_feitos": ["Lista do que FOI FEITO"],
-                      "proximos_passos": ["Lista do que SERÁ FEITO"],
-                      "riscos_bloqueios": "Reclamações ou impedimentos citados.",
-                      "sentimento_score": "Número 0-10",
-                      "status_projeto": "Em Dia/Atrasado/Pausado"
+                      "resumo_executivo": "Situação atual baseada nos fatos do texto.",
+                      "perfil_cliente": "Análise do comportamento e tom do cliente.",
+                      "estrategia_relacionamento": "Ação recomendada para o CS.",
+                      "checkpoints_feitos": ["Lista do que já foi entregue"],
+                      "proximos_passos": ["Lista do que falta fazer"],
+                      "riscos_bloqueios": "Impedimentos ou insatisfações citadas.",
+                      "sentimento_score": "0 a 10",
+                      "status_projeto": "Em Dia/Atrasado"
                    }`
-                : `Analise este trecho. Extraia fatos, datas e sentimentos. Ignore saudações. Acumule inteligência.`;
+                : `Leia este trecho (pode conter tabelas desformatadas). Identifique datas, entregas e reclamações. Ignore linhas vazias.`;
 
             let respostaIA = "";
             for (let retry = 0; retry < 2; retry++) {
@@ -216,7 +233,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
                         params: {
                             aiName: BOT_NAME,
                             aiId: BOT_ID,
-                            context: `CONTEXTO ACUMULADO: ${safeMemory || "Início"}\n\nTEXTO DO DOC:\n${chunk}`,
+                            context: `RESUMO ANTERIOR: ${safeMemory || "Início"}\n\nCONTEÚDO DO DOC:\n${chunk}`,
                             question: prompt
                         },
                         headers: { 'Authorization': authHeader }
@@ -233,7 +250,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
             if (respostaIA) currentMemory = respostaIA;
         }
 
-        // 4. RENDERIZAÇÃO
+        // 4. Renderização
         step = "Gerando Visualização";
         if (!currentMemory) return res.json({ success: false, error: `IA muda.` });
 
@@ -243,7 +260,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
         try {
             data = JSON.parse(jsonOnly);
         } catch (e) {
-            data = { resumo_executivo: "Erro ao estruturar dados: " + currentMemory.substring(0, 200) };
+            data = { resumo_executivo: "Erro ao processar JSON da IA. Texto bruto: " + currentMemory.substring(0, 100) };
         }
 
         const score = parseInt(data.sentimento_score) || 5;
@@ -254,7 +271,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
         const htmlResumo = `
             <div class="space-y-4 font-sans">
                 <div class="text-xs text-slate-300 leading-relaxed border-l-2 border-indigo-500 pl-3">
-                    ${data.resumo_executivo}
+                    ${data.resumo_executivo || "Sem dados."}
                 </div>
 
                 <div class="grid grid-cols-2 gap-2">
@@ -324,9 +341,20 @@ app.post('/api/resumir-empresa', async (req, res) => {
     }
 });
 
+app.get('/api/debug-bot', async (req, res) => {
+    try {
+        const rawToken = getHeadOfficeToken();
+        const response = await axios.get(`${BASE_URL}/openai/question`, {
+            params: { aiName: BOT_NAME, aiId: BOT_ID, question: "Olá" },
+            headers: { 'Authorization': rawToken }
+        });
+        res.json({ text: response.data.text, full: response.data });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 module.exports = app;
 
-// --- FRONTEND PREMIUM (MANTIDO) ---
+// --- FRONTEND ---
 const DASHBOARD_HTML = `
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -339,27 +367,13 @@ const DASHBOARD_HTML = `
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@300;400;600;700;900&display=swap" rel="stylesheet">
     <style>
         body { font-family: 'Inter', sans-serif; background-color: #020617; color: #f8fafc; overflow-x: hidden; }
-        .glass-card {
-            background: rgba(15, 23, 42, 0.6);
-            backdrop-filter: blur(12px);
-            border: 1px solid rgba(255, 255, 255, 0.08);
-            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-        }
-        .glass-card:hover {
-            border-color: rgba(99, 102, 241, 0.4);
-            transform: translateY(-4px);
-            box-shadow: 0 20px 40px -10px rgba(99, 102, 241, 0.15);
-            background: rgba(30, 41, 59, 0.7);
-        }
+        .glass-card { background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3); transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
+        .glass-card:hover { border-color: rgba(99, 102, 241, 0.4); transform: translateY(-4px); box-shadow: 0 20px 40px -10px rgba(99, 102, 241, 0.15); background: rgba(30, 41, 59, 0.7); }
         .badge { padding: 4px 10px; border-radius: 99px; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid; box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
         .st-Satisfeito, .st-EmDia { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
         .st-Crítico, .st-Atrasado, .st-Risco { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border-color: rgba(239, 68, 68, 0.3); }
         .st-Neutro, .st-EmAnálise { background: rgba(148, 163, 184, 0.15); color: #e2e8f0; border-color: rgba(148, 163, 184, 0.3); }
-        .bg-grid {
-            background-image: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px);
-            background-size: 30px 30px;
-        }
+        .bg-grid { background-image: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px); background-size: 30px 30px; }
     </style>
 </head>
 <body class="min-h-screen bg-grid">
