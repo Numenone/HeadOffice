@@ -16,7 +16,10 @@ const supabase = createClient(
 );
 
 const BASE_URL = 'https://api.headoffice.ai/v1';
-const SHEET_CSV_URL = 'https://docs.google.com/spreadsheets/d/1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM/export?format=csv';
+// ID da planilha extraído do link
+const SHEET_ID = '1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM';
+const SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=0`;
+const SHEET_FULL_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`;
 
 app.get('/', (req, res) => {
     const currentUrl = `https://${req.headers.host}`;
@@ -38,82 +41,118 @@ app.post('/api/empresas', async (req, res) => {
     res.json({ success: true, data });
 });
 
-// --- ROTA DE RESUMO ---
+// --- ROTA DE RESUMO HÍBRIDA ---
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     
-    // ======================================================
-    // 🚨 ÁREA DE EMERGÊNCIA 🚨
-    // Se a variável de ambiente falhar, cole o token aqui entre as aspas
+    // --- TRATAMENTO DE TOKEN ---
+    // (Mantemos a lógica de emergência caso precise)
     const TOKEN_DE_EMERGENCIA = ""; 
-    // ======================================================
     
     let rawToken = TOKEN_DE_EMERGENCIA || process.env.HEADOFFICE_JWT || "";
-    
-    // Limpeza básica (remove espaços e aspas extras)
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
     
-    // MUDANÇA: Removemos "Bearer ". O header será apenas o token.
-    // Se o token já vier com Bearer colado, removemos para garantir.
+    // Remove "Bearer" se existir, pois a API quer só o token
     if (rawToken.toLowerCase().startsWith('bearer ')) {
-        rawToken = rawToken.substring(7).trim(); // Remove "Bearer " do início
+        rawToken = rawToken.substring(7).trim();
     }
     
-    const authHeader = rawToken; // Envia SOMENTE O CÓDIGO
-
-    // Debug
-    console.log(`[DEBUG] Token sendo enviado (primeiros 10 chars): ${authHeader.substring(0, 10)}...`);
-
-    if (rawToken.length < 10) {
-        return res.status(500).json({ error: "Token inválido/vazio." });
+    // Se o token for curto demais, nem tenta
+    if (rawToken.length < 20) {
+        return res.status(500).json({ error: "Token JWT não configurado ou inválido." });
     }
 
+    const authHeader = rawToken; // Token puro
+
     let step = "Início";
+    let docUrl = null;
 
     try {
-        // PASSO 1: Buscar Link na Planilha via CSV
-        step = "Baixando CSV";
-        const csvResponse = await axios.get(SHEET_CSV_URL);
-        const csvData = csvResponse.data;
-        const lines = csvData.split('\n');
-        let docUrl = null;
-
-        for (const line of lines) {
-            if (line.toLowerCase().includes(nome.toLowerCase())) {
-                const match = line.match(/(https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+)/);
-                if (match) {
-                    docUrl = match[0];
-                    break;
+        // ==========================================================
+        // TENTATIVA 1: BUSCA RÁPIDA VIA CSV (Sem gastar IA)
+        // ==========================================================
+        step = "Baixando CSV (Tentativa 1)";
+        try {
+            const csvResponse = await axios.get(SHEET_CSV_URL);
+            const lines = csvResponse.data.split('\n');
+            
+            for (const line of lines) {
+                if (line.toLowerCase().includes(nome.toLowerCase())) {
+                    // Regex mais permissiva para pegar links do Docs
+                    const match = line.match(/(https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+)/);
+                    if (match) {
+                        docUrl = match[0];
+                        console.log(`[CSV] Link encontrado para ${nome}: ${docUrl}`);
+                        break;
+                    }
                 }
+            }
+        } catch (csvError) {
+            console.warn("[CSV] Falha ao baixar ou processar CSV. Tentando via IA.");
+        }
+
+        // ==========================================================
+        // TENTATIVA 2: BUSCA VIA IA (Se o CSV falhou)
+        // ==========================================================
+        if (!docUrl) {
+            step = "Perguntando para a IA (Tentativa 2)";
+            console.log(`[IA] CSV falhou para ${nome}. Perguntando à HeadOffice...`);
+            
+            const aiSearch = await axios.get(`${BASE_URL}/openai/question`, {
+                params: {
+                    aiName: 'Roger', 
+                    context: `Analise a planilha: ${SHEET_FULL_URL}`,
+                    // Pergunta específica para forçar a IA a caçar o link
+                    question: `Encontre a linha da empresa "${nome}". Extraia a URL do Google Docs que está na coluna "Links Docs" (mesmo se for um hyperlink). Retorne APENAS a URL.`
+                },
+                headers: { 'Authorization': authHeader }
+            });
+
+            const answerAI = aiSearch.data.answer || "";
+            const matchAI = answerAI.match(/(https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+)/);
+            
+            if (matchAI) {
+                docUrl = matchAI[0];
+                console.log(`[IA] Link encontrado: ${docUrl}`);
+            } else {
+                return res.json({ 
+                    success: false, 
+                    error: `Link não encontrado nem no CSV nem pela IA. Verifique se o nome "${nome}" está correto na planilha.` 
+                });
             }
         }
 
-        if (!docUrl) return res.json({ success: false, error: `Link não encontrado no CSV para: ${nome}` });
-
-        // PASSO 2: Resumir (IA)
-        step = "Chamando API HeadOffice";
+        // ==========================================================
+        // PASSO FINAL: RESUMIR O DOCUMENTO ENCONTRADO
+        // ==========================================================
+        step = `Lendo Documento: ${docUrl}`;
         
         const summaryResponse = await axios.get(`${BASE_URL}/openai/question`, {
             params: {
                 aiName: 'Roger',
                 context: `Documento: ${docUrl}`,
-                question: `Leia a ÚLTIMA sessão. JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico", "status_projeto": "Em Dia/Atrasado"}`
+                question: `Aja como Gerente de Projetos. Leia a ÚLTIMA sessão registrada (data mais recente). Retorne JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico/Neutro", "status_projeto": "Em Dia/Atrasado"}`
             },
-            headers: { 'Authorization': authHeader } // Sem Bearer, apenas token
+            headers: { 'Authorization': authHeader }
         });
 
-        // Tratamento
+        // Tratamento do JSON
         let result = {};
         const answerRaw = summaryResponse.data.answer || "";
+        
         try {
             const cleanJson = answerRaw.replace(/```json/g, '').replace(/```/g, '').trim();
             result = JSON.parse(cleanJson);
         } catch (e) {
-            result = { resumo: answerRaw.substring(0, 400), status_cliente: "Erro Leitura", status_projeto: "Erro Leitura" };
+            result = { 
+                resumo: answerRaw.substring(0, 500), 
+                status_cliente: "Erro Parse", 
+                status_projeto: "Erro Parse" 
+            };
         }
 
-        // Salvar
+        // Salvar no Supabase
         const updatePayload = {
             doc_link: docUrl,
             resumo: result.resumo,
@@ -124,19 +163,21 @@ app.post('/api/resumir-empresa', async (req, res) => {
         };
 
         await supabase.from('empresas').update(updatePayload).eq('id', id);
+
         res.json({ success: true, data: updatePayload });
 
     } catch (error) {
         console.error(`[ERRO] Passo: ${step}`, error.message);
-        if (error.response) {
-            console.error(`[ERRO RESPOSTA]`, JSON.stringify(error.response.data));
-            return res.status(500).json({ 
-                error: "Erro API HeadOffice", 
-                step, 
-                details: error.response.data 
-            });
-        }
-        res.status(500).json({ error: "Erro interno", step, details: error.message });
+        
+        const errorDetail = error.response && error.response.data 
+            ? JSON.stringify(error.response.data)
+            : error.message;
+
+        res.status(500).json({ 
+            error: "Falha no processamento", 
+            step, 
+            details: errorDetail 
+        });
     }
 });
 
@@ -160,7 +201,7 @@ const DASHBOARD_HTML = `
         @keyframes twinkle { 0%, 100% { opacity: 0.2; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1.2); } }
         .status-Satisfeito, .status-EmDia { color: #4ade80; background: rgba(74, 222, 128, 0.1); border-color: rgba(74, 222, 128, 0.2); }
         .status-Crítico, .status-Atrasado, .status-Bug { color: #f87171; background: rgba(248, 113, 113, 0.1); border-color: rgba(248, 113, 113, 0.2); }
-        .status-Neutro, .status-Aguardando { color: #94a3b8; background: rgba(148, 163, 184, 0.1); border-color: rgba(148, 163, 184, 0.2); }
+        .status-Neutro, .status-Aguardando, .status-ErroParse { color: #94a3b8; background: rgba(148, 163, 184, 0.1); border-color: rgba(148, 163, 184, 0.2); }
     </style>
 </head>
 <body class="min-h-screen p-6 md:p-12">
