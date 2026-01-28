@@ -19,7 +19,6 @@ const supabase = createClient(
 const BASE_URL = 'https://api.headoffice.ai/v1';
 const SHEET_ID = '1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM';
 const SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=0`;
-const SHEET_FULL_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`;
 
 // ID DO BOT ROGER
 const BOT_ID = '69372353b11d9df606b68bf8';
@@ -32,22 +31,23 @@ app.get('/', (req, res) => {
     res.send(htmlComUrl);
 });
 
-// --- HELPER AUTH HEADOFFICE (SEM BEARER) ---
+// --- HELPER AUTH HEADOFFICE (ZERO BEARER) ---
 function getHeadOfficeToken() {
     let rawToken = process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
+    
     return rawToken.length > 10 ? rawToken : null;
 }
 
-// --- HELPER AUTH GOOGLE (GCP) ---
+// --- HELPER AUTH GOOGLE (DOCS) ---
 function getGoogleAuth() {
     const privateKey = process.env.GOOGLE_PRIVATE_KEY 
         ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') 
         : undefined;
 
     if (!privateKey || !process.env.GOOGLE_CLIENT_EMAIL) {
-        throw new Error("Credenciais GCP faltando (GOOGLE_CLIENT_EMAIL/PRIVATE_KEY).");
+        throw new Error("Credenciais GCP faltando.");
     }
 
     return new google.auth.GoogleAuth({
@@ -59,27 +59,23 @@ function getGoogleAuth() {
     });
 }
 
-// --- HELPER: PARSE DE DATA EM TÍTULOS ---
+// --- PARSE DE DATAS NOS TÍTULOS ---
 function parseDateFromTitle(title) {
-    // Tenta capturar formatos: 28/01/2026, 28-01-26, 28.01
-    // Assume ano atual se não tiver ano
+    // Busca datas como: 28/01, 28.01, 28-01-2026
     const regex = /(\d{1,2})[\/\.\-](\d{1,2})(?:[\/\.\-](\d{2,4}))?/;
     const match = title.match(regex);
     
     if (match) {
         const day = parseInt(match[1]);
-        const month = parseInt(match[2]) - 1; // JS meses são 0-11
+        const month = parseInt(match[2]) - 1; 
         let year = match[3] ? parseInt(match[3]) : new Date().getFullYear();
-        
-        // Ajuste para anos de 2 dígitos (ex: 26 vira 2026)
         if (year < 100) year += 2000;
-
         return new Date(year, month, day);
     }
-    return null;
+    return null; // Sem data = aba antiga ou genérica
 }
 
-// --- HELPER: EXTRATOR DE CONTEÚDO (BODY OU TAB) ---
+// --- EXTRATOR DE TEXTO (RECURSIVO) ---
 function readStructuralElements(elements) {
     let text = '';
     if (!elements) return text;
@@ -103,83 +99,68 @@ function readStructuralElements(elements) {
     return text;
 }
 
-// --- HELPER: LER DOCUMENTO INTELIGENTE (ÚLTIMA ABA) ---
-async function getLatestDocContent(docId) {
+// --- GET DOC CONTENT (MULTI-TAB) ---
+async function getAllTabsContent(docId) {
     try {
         const auth = getGoogleAuth();
         const client = await auth.getClient();
         const docs = google.docs({ version: 'v1', auth: client });
 
-        console.log(`[GCP] Acessando Doc ID: ${docId}`);
+        console.log(`[GCP] Baixando Doc: ${docId}`);
         const res = await docs.documents.get({ documentId: docId });
         const doc = res.data;
 
-        let targetContent = null;
-        let sourceName = "Corpo Principal";
+        let tabsData = [];
 
-        // VERIFICA SE EXISTEM ABAS (TABS)
+        // 1. Processa Abas (Tabs)
         if (doc.tabs && doc.tabs.length > 0) {
-            console.log(`[GCP] O documento possui ${doc.tabs.length} abas. Analisando datas...`);
-            
-            // Mapeia abas para objetos com data
-            const tabList = doc.tabs.map(t => {
-                const title = t.tabProperties.title || "";
+            doc.tabs.forEach(t => {
+                const title = t.tabProperties.title || "Sem título";
                 const date = parseDateFromTitle(title);
-                return { 
-                    tab: t, 
-                    title: title, 
-                    date: date,
-                    timestamp: date ? date.getTime() : 0 
-                };
+                let content = "";
+                
+                if (t.documentTab && t.documentTab.body) {
+                    content = readStructuralElements(t.documentTab.body.content);
+                }
+
+                if (content.trim().length > 0) {
+                    tabsData.push({
+                        title: title,
+                        date: date,
+                        timestamp: date ? date.getTime() : 0, // 0 joga pro final (ou início dependendo do sort)
+                        content: content
+                    });
+                }
             });
-
-            // Ordena pela data mais recente
-            // Se tiver data, usa ela. Se não, joga pro final.
-            tabList.sort((a, b) => b.timestamp - a.timestamp);
-
-            const latestTab = tabList[0];
-            
-            if (latestTab.date) {
-                console.log(`[GCP] Aba mais recente encontrada: "${latestTab.title}" (${latestTab.date.toLocaleDateString()})`);
-                // O conteúdo da aba fica em documentTab.body.content
-                if (latestTab.tab.documentTab && latestTab.tab.documentTab.body) {
-                    targetContent = latestTab.tab.documentTab.body.content;
-                    sourceName = `Aba: ${latestTab.title}`;
-                }
-            } else {
-                console.log(`[GCP] Nenhuma data encontrada nos nomes das abas. Usando a primeira aba.`);
-                if (tabList[0].tab.documentTab) {
-                    targetContent = tabList[0].tab.documentTab.body.content;
-                }
-            }
         } 
         
-        // Fallback: Se não tem abas ou falhou, usa o corpo principal (Legacy)
-        if (!targetContent) {
-            targetContent = doc.body.content;
+        // 2. Se não houver abas, pega o corpo principal
+        if (tabsData.length === 0) {
+            const bodyContent = readStructuralElements(doc.body.content);
+            if (bodyContent.trim().length > 0) {
+                tabsData.push({
+                    title: "Documento Principal",
+                    date: new Date(), // Assume hoje
+                    timestamp: new Date().getTime(),
+                    content: bodyContent
+                });
+            }
         }
 
-        return {
-            text: readStructuralElements(targetContent),
-            source: sourceName
-        };
+        // 3. ORDENAÇÃO CRONOLÓGICA (Antiga -> Recente)
+        // Isso é crucial para a IA entender a história "acontecendo".
+        // Itens sem data (timestamp 0) vão para o começo como "Contexto Geral".
+        tabsData.sort((a, b) => a.timestamp - b.timestamp);
+
+        return tabsData;
 
     } catch (error) {
-        if (error.code === 403) throw new Error(`Permissão negada. Compartilhe o doc com: ${process.env.GOOGLE_CLIENT_EMAIL}`);
-        if (error.code === 404) throw new Error("Documento não encontrado (404).");
+        if (error.code === 403) throw new Error(`Permissão GCP negada. Compartilhe o doc com: ${process.env.GOOGLE_CLIENT_EMAIL}`);
         throw error;
     }
 }
 
-// --- HELPERS GERAIS ---
-function splitText(text, chunkSize) {
-    const chunks = [];
-    for (let i = 0; i < text.length; i += chunkSize) {
-        chunks.push(text.substring(i, i + chunkSize));
-    }
-    return chunks;
-}
-
+// --- HELPER JSON ---
 function extractJSON(text) {
     if (!text) return null;
     const start = text.indexOf('{');
@@ -206,7 +187,7 @@ app.post('/api/empresas', async (req, res) => {
 });
 
 // ======================================================
-// LÓGICA CS INTELLIGENCE (LATEST TAB EDITION)
+// LÓGICA DE INTELIGÊNCIA (MULTI-TAB TIMELINE)
 // ======================================================
 
 app.post('/api/resumir-empresa', async (req, res) => {
@@ -220,7 +201,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
     let docId = null;
 
     try {
-        // 1. BUSCAR LINK NO CSV
+        // 1. LINK NO CSV
         step = "Buscando Link no CSV";
         try {
             const csvResponse = await axios.get(SHEET_CSV_URL);
@@ -239,88 +220,121 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
         if (!docUrl || !docId) return res.json({ success: false, error: `Link não encontrado para ${nome}.` });
 
-        // 2. LER ABA MAIS RECENTE
-        step = `Lendo Última Sessão (GCP)`;
-        let docData = { text: "", source: "" };
-        
+        // 2. EXTRAIR TODAS AS ABAS
+        step = `Lendo Abas do Doc`;
+        let allTabs = [];
         try {
-            docData = await getLatestDocContent(docId);
-            
-            if (!docData.text || docData.text.trim().length < 20) {
-                return res.json({ success: false, error: `A aba "${docData.source}" está vazia ou ilegível.` });
-            }
+            allTabs = await getAllTabsContent(docId);
+            if (allTabs.length === 0) return res.json({ success: false, error: "Doc vazio ou ilegível." });
         } catch (apiError) {
-            console.error("Erro Docs API:", apiError.message);
             return res.json({ success: false, error: apiError.message });
         }
 
-        // 3. PROCESSAMENTO DE INTELIGÊNCIA
-        step = "Análise da Sessão";
+        // 3. PROCESSAMENTO EM CADEIA (TIMELINE)
+        step = "Análise Histórica (Timeline)";
         
-        // Como estamos lendo apenas uma aba (sessão), o texto deve ser menor e mais focado.
-        // Pegamos os primeiros 6000 caracteres da aba, que geralmente cobrem a reunião toda.
-        const sessionText = docData.text.slice(0, 6000); 
-        
-        console.log(`[IA] Analisando conteúdo de: ${docData.source}`);
+        let currentMemory = "Início da análise. Nenhum dado prévio.";
+        console.log(`[IA] Processando ${allTabs.length} abas cronologicamente...`);
 
-        let currentMemory = "";
+        // Loop por cada aba (da mais antiga para a mais recente)
+        for (let i = 0; i < allTabs.length; i++) {
+            const tab = allTabs[i];
+            const isLast = i === allTabs.length - 1; // É a aba mais recente?
+            
+            // Se o texto da aba for gigante, corta para não estourar tokens da IA
+            const tabContentSafe = tab.content.slice(0, 8000); 
+            
+            // Título para log
+            console.log(`[IA] Analisando Aba ${i+1}/${allTabs.length}: "${tab.title}"`);
 
-        // Prompt focado em "Última Atualização"
-        const prompt = `VOCÊ É UM DIRETOR DE SUCESSO DO CLIENTE.
-           Abaixo está o registro da ÚLTIMA REUNIÃO/SESSÃO realizada (${docData.source}).
-           
-           OBJETIVO: Extrair status atual e próximos passos.
-           
-           INSTRUÇÕES:
-           1. Use APENAS este texto. Não invente.
-           2. **Checkpoints:** O que foi finalizado NESTA reunião?
-           3. **Próximos Passos:** O que ficou combinado para a próxima?
-           4. **Sentimento:** Qual foi o clima DESTA conversa?
+            // --- LÓGICA DO PROMPT DINÂMICO ---
+            let prompt = "";
 
-           Gere JSON estrito:
-           {
-              "resumo_executivo": "Resumo do que foi discutido nesta última sessão.",
-              "perfil_cliente": "Comportamento do cliente nesta reunião.",
-              "estrategia_relacionamento": "O que o CS deve fazer agora?",
-              "checkpoints_feitos": ["Item A", "Item B"],
-              "proximos_passos": ["Pendência 1", "Pendência 2"],
-              "riscos_bloqueios": "Algum bloqueio levantado hoje?",
-              "sentimento_score": "0-10",
-              "status_projeto": "Em Dia/Atrasado"
-           }`;
-
-        // Chamada Única e Direta (já que o texto da aba é focado)
-        let respostaIA = "";
-        for (let retry = 0; retry < 2; retry++) {
-            try {
-                const response = await axios.get(`${BASE_URL}/openai/question`, {
-                    params: {
-                        aiName: BOT_NAME,
-                        aiId: BOT_ID,
-                        context: `REGISTRO DA SESSÃO (${docData.source}):\n${sessionText}`,
-                        question: prompt
-                    },
-                    headers: { 'Authorization': authHeader }
-                });
+            if (!isLast) {
+                // ABAS ANTIGAS: Foco em Acumular Contexto (Sentimento, Histórico)
+                prompt = `ATUE COMO CS MANAGER. Estamos analisando o histórico do cliente.
+                Abaixo está o registro de uma REUNIÃO PASSADA (Data/Titulo: ${tab.title}).
                 
-                const textoResposta = response.data.text || response.data.answer;
-                if (textoResposta && textoResposta.trim().length > 0) {
-                    respostaIA = textoResposta;
-                    break; 
+                MEMÓRIA ATUAL: ${currentMemory}
+                
+                INSTRUÇÃO:
+                Atualize a memória com fatos desta reunião:
+                1. O sentimento do cliente mudou?
+                2. Quais checkpoints foram concluídos NESSA data?
+                3. Alguma reclamação importante surgiu aqui?
+                
+                Seja conciso. Responda apenas com o novo Resumo Atualizado.`;
+            } else {
+                // ABA FINAL (MAIS RECENTE): Foco em Status Atual + Próximos Passos
+                prompt = `ATUE COMO DIRETOR DE CS. ESTA É A ÚLTIMA REUNIÃO REGISTRADA (${tab.title}).
+                
+                CONTEXTO HISTÓRICO (Memória das abas anteriores): 
+                ${currentMemory}
+                
+                CONTEÚDO DA ÚLTIMA REUNIÃO (Texto Abaixo):
+                ${tabContentSafe}
+                
+                --- MISSÃO FINAL ---
+                Gere o Relatório de Inteligência Oficial.
+                
+                REGRAS RÍGIDAS:
+                1. **Checkpoints/Metas:** Use EXCLUSIVAMENTE o texto da "ÚLTIMA REUNIÃO" para definir o que acabou de ser feito e o que ficou para a próxima agenda. Não misture com coisas de 2024.
+                2. **Sentimento/Perfil:** Use o CONTEXTO HISTÓRICO + A ÚLTIMA REUNIÃO para definir o perfil psicológico e a nota geral.
+                
+                SAÍDA JSON ESTRITO:
+                {
+                    "resumo_executivo": "Visão geral do momento atual da conta.",
+                    "perfil_cliente": "Análise psicológica profunda (baseada em todo o histórico).",
+                    "estrategia_relacionamento": "Como lidar com esse cliente hoje?",
+                    "checkpoints_feitos": ["O que foi entregue NESTA ÚLTIMA sessão?"],
+                    "proximos_passos": ["O que ficou agendado para a PRÓXIMA?"],
+                    "riscos_bloqueios": "Alertas ativos.",
+                    "sentimento_score": "0 a 10",
+                    "status_projeto": "Em Dia/Atrasado"
+                }`;
+            }
+
+            // Chamada IA
+            let respostaIA = "";
+            for (let retry = 0; retry < 2; retry++) {
+                try {
+                    const response = await axios.get(`${BASE_URL}/openai/question`, {
+                        params: {
+                            aiName: BOT_NAME,
+                            aiId: BOT_ID,
+                            question: prompt
+                        },
+                        headers: { 'Authorization': authHeader }
+                    });
+                    
+                    const tResp = response.data.text || response.data.answer;
+                    if (tResp && tResp.trim().length > 0) {
+                        respostaIA = tResp;
+                        break; 
+                    }
+                } catch (e) { console.error("Erro IA:", e.message); }
+            }
+
+            if (respostaIA) {
+                // Se não for a última, a resposta vira a memória para a próxima iteração
+                // Se for a última, a resposta é o JSON final
+                if (!isLast) {
+                    // Mantém a memória num tamanho saudável
+                    currentMemory = respostaIA.slice(0, 3000); 
+                } else {
+                    currentMemory = respostaIA; // JSON Final
                 }
-            } catch (e) { console.error("Erro IA:", e.message); }
+            }
         }
 
-        if (!respostaIA) return res.json({ success: false, error: `IA não retornou análise.` });
-
         // 4. RENDERIZAÇÃO
-        const jsonOnly = extractJSON(respostaIA);
+        const jsonOnly = extractJSON(currentMemory);
         let data = {};
 
         try {
             data = JSON.parse(jsonOnly);
         } catch (e) {
-            data = { resumo_executivo: "Erro JSON IA. Texto: " + respostaIA.substring(0, 150) };
+            data = { resumo_executivo: "Erro ao gerar JSON Final. Texto: " + currentMemory.substring(0, 200) };
         }
 
         const score = parseInt(data.sentimento_score) || 5;
@@ -328,30 +342,33 @@ app.post('/api/resumir-empresa', async (req, res) => {
         if (score >= 8) scoreColor = "text-emerald-400 border-emerald-500/30 bg-emerald-500/10";
         if (score <= 4) scoreColor = "text-red-400 border-red-500/30 bg-red-500/10";
 
+        // Busca a data da última aba para mostrar no card
+        const lastTabName = allTabs[allTabs.length-1].title;
+
         const htmlResumo = `
             <div class="space-y-4 font-sans">
                 <div class="flex items-center justify-between mb-2">
-                    <span class="text-[9px] uppercase font-mono text-indigo-400 bg-indigo-500/10 px-2 py-1 rounded border border-indigo-500/20">
-                        📄 Fonte: ${docData.source}
+                    <span class="text-[9px] uppercase font-mono text-indigo-300 bg-indigo-500/10 px-2 py-1 rounded border border-indigo-500/20">
+                        📅 Base: ${lastTabName}
                     </span>
                 </div>
 
                 <div class="text-xs text-slate-300 leading-relaxed border-l-2 border-indigo-500 pl-3">
-                    ${data.resumo_executivo || "Sem resumo."}
+                    ${data.resumo_executivo}
                 </div>
 
                 <div class="grid grid-cols-2 gap-2">
                     <div class="bg-[#0f172a] p-2.5 rounded border border-white/5 hover:border-indigo-500/30 transition-colors">
                         <div class="flex items-center gap-2 mb-1">
                             <i data-lucide="brain" class="w-3 h-3 text-purple-400"></i>
-                            <span class="text-[10px] font-bold text-purple-200 uppercase tracking-wide">Comportamento</span>
+                            <span class="text-[10px] font-bold text-purple-200 uppercase tracking-wide">Perfil (Histórico)</span>
                         </div>
                         <p class="text-[10px] text-slate-400 leading-snug">${data.perfil_cliente || "-"}</p>
                     </div>
                     <div class="bg-[#0f172a] p-2.5 rounded border border-white/5 hover:border-emerald-500/30 transition-colors">
                         <div class="flex items-center gap-2 mb-1">
                             <i data-lucide="compass" class="w-3 h-3 text-emerald-400"></i>
-                            <span class="text-[10px] font-bold text-emerald-200 uppercase tracking-wide">Ação CS</span>
+                            <span class="text-[10px] font-bold text-emerald-200 uppercase tracking-wide">Estratégia</span>
                         </div>
                         <p class="text-[10px] text-slate-400 leading-snug italic">"${data.estrategia_relacionamento || "-"}"</p>
                     </div>
@@ -360,7 +377,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
                 <div class="grid grid-cols-1 gap-2">
                     ${(data.checkpoints_feitos && data.checkpoints_feitos.length > 0) ? `
                     <div class="bg-white/[0.02] p-2 rounded border border-white/5">
-                        <h4 class="text-[10px] font-bold text-slate-500 uppercase mb-2 flex items-center gap-1"><i data-lucide="check-circle-2" class="w-3 h-3"></i> Realizado nesta sessão</h4>
+                        <h4 class="text-[10px] font-bold text-slate-500 uppercase mb-2 flex items-center gap-1"><i data-lucide="check-circle-2" class="w-3 h-3"></i> Feito na Última Sessão</h4>
                         <ul class="space-y-1">
                             ${data.checkpoints_feitos.map(i => `<li class="text-[10px] text-slate-400 flex items-start gap-2"><span class="w-1 h-1 bg-green-500/50 rounded-full mt-1.5"></span><span class="flex-1">${i}</span></li>`).join('')}
                         </ul>
@@ -377,8 +394,8 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
                 <div class="flex gap-2 items-stretch">
                     <div class="flex-1 ${data.riscos_bloqueios && data.riscos_bloqueios.length > 5 ? 'bg-red-500/10 border-red-500/20' : 'bg-slate-800/50 border-white/5'} border p-2 rounded flex flex-col justify-center">
-                        <span class="text-[9px] uppercase font-bold ${data.riscos_bloqueios && data.riscos_bloqueios.length > 5 ? 'text-red-400' : 'text-slate-500'} block mb-1">Bloqueios</span>
-                        <p class="text-[10px] ${data.riscos_bloqueios && data.riscos_bloqueios.length > 5 ? 'text-red-200' : 'text-slate-500'} leading-tight">${data.riscos_bloqueios || "Nenhum."}</p>
+                        <span class="text-[9px] uppercase font-bold ${data.riscos_bloqueios && data.riscos_bloqueios.length > 5 ? 'text-red-400' : 'text-slate-500'} block mb-1">Alertas</span>
+                        <p class="text-[10px] ${data.riscos_bloqueios && data.riscos_bloqueios.length > 5 ? 'text-red-200' : 'text-slate-500'} leading-tight">${data.riscos_bloqueios || "Tudo sob controle."}</p>
                     </div>
                     <div class="w-16 flex flex-col items-center justify-center p-1 rounded border ${scoreColor}">
                         <span class="text-[8px] uppercase font-bold opacity-70">Humor</span>
