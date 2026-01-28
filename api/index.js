@@ -1,5 +1,6 @@
 // api/index.js
 require('dotenv').config();
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
@@ -116,5 +117,9 @@ app.post('/api/sync-agent', async (req, res) => {
     }
 });
 
+// Rota para servir o Dashboard
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'index.html'));
+});
 // IMPORTANTE: Não use app.listen aqui. Exporte o app.
 module.exports = app;
