@@ -24,6 +24,7 @@ const SHEET_FULL_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`
 const BOT_ID = '69372353b11d9df606b68bf8';
 const BOT_NAME = 'Roger';
 
+// --- ROTA DASHBOARD ---
 app.get('/', (req, res) => {
     const currentUrl = `https://${req.headers.host}`;
     const htmlComUrl = DASHBOARD_HTML.replace('https://head-office-one.vercel.app', currentUrl);
@@ -36,6 +37,7 @@ function getAuthToken() {
     let rawToken = TOKEN_DE_EMERGENCIA || process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
+    if (rawToken.toLowerCase().startsWith('bearer ')) rawToken = rawToken.substring(7).trim();
     return rawToken.length > 10 ? rawToken : null;
 }
 
@@ -59,7 +61,30 @@ function extractJSON(text) {
     return text;
 }
 
-// --- ROTA PRINCIPAL ---
+// ======================================================
+// AS ROTAS QUE FALTAVAM (RESTAURADAS)
+// ======================================================
+
+// Rota para LISTAR empresas
+app.get('/api/empresas', async (req, res) => {
+    const { data, error } = await supabase.from('empresas').select('*').order('nome', { ascending: true });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data);
+});
+
+// Rota para CRIAR empresa
+app.post('/api/empresas', async (req, res) => {
+    const { nome } = req.body;
+    if (!nome) return res.status(400).json({ error: "Nome obrigatório" });
+    const { data, error } = await supabase.from('empresas').insert([{ nome }]).select();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true, data });
+});
+
+// ======================================================
+// LÓGICA DE INTELIGÊNCIA ARTIFICIAL
+// ======================================================
+
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     const authHeader = getAuthToken();
@@ -94,7 +119,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
                 },
                 headers: { 'Authorization': authHeader }
             });
-            // CORREÇÃO: Busca em .text OU .answer
+            // Busca em .text OU .answer
             const answerAI = aiSearch.data.text || aiSearch.data.answer || "";
             const matchAI = answerAI.match(/(https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+)/);
             if (matchAI) docUrl = matchAI[0];
@@ -149,7 +174,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
                         headers: { 'Authorization': authHeader }
                     });
                     
-                    // CORREÇÃO CRÍTICA: Lendo 'text' em vez de 'answer'
+                    // CORREÇÃO CRÍTICA: Lendo 'text'
                     const textoResposta = response.data.text || response.data.answer;
 
                     if (textoResposta && textoResposta.trim().length > 0) {
@@ -171,7 +196,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
         step = "Processando JSON";
         
         if (!currentMemory) {
-             return res.json({ success: false, error: `IA não retornou texto.` });
+             return res.json({ success: false, error: `IA muda. ID usado: ${BOT_ID}.` });
         }
 
         const jsonOnly = extractJSON(currentMemory);
@@ -205,7 +230,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
     }
 });
 
-// --- API DEBUG BOT (Atualizada) ---
+// --- API DEBUG BOT ---
 app.get('/api/debug-bot', async (req, res) => {
     try {
         const rawToken = getAuthToken();
