@@ -18,21 +18,18 @@ const supabase = createClient(
 const BASE_URL = 'https://api.headoffice.ai/v1';
 const SHEET_FULL_URL = 'https://docs.google.com/spreadsheets/d/1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM/edit?gid=0#gid=0';
 
-// --- ROTA 1: DASHBOARD ---
 app.get('/', (req, res) => {
     const currentUrl = `https://${req.headers.host}`;
     const htmlComUrl = DASHBOARD_HTML.replace('https://head-office-one.vercel.app', currentUrl);
     res.send(htmlComUrl);
 });
 
-// --- ROTA 2: LISTAR EMPRESAS ---
 app.get('/api/empresas', async (req, res) => {
     const { data, error } = await supabase.from('empresas').select('*').order('nome', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
     res.json(data);
 });
 
-// --- ROTA 3: CRIAR EMPRESA ---
 app.post('/api/empresas', async (req, res) => {
     const { nome } = req.body;
     if (!nome) return res.status(400).json({ error: "Nome obrigatório" });
@@ -41,84 +38,68 @@ app.post('/api/empresas', async (req, res) => {
     res.json({ success: true, data });
 });
 
-// --- ROTA 4: RESUMIR EMPRESA ---
+// --- ROTA DE RESUMO COM LOGS DE DEBUG ---
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     
-    // --- TRATAMENTO DE TOKEN (A PARTE IMPORTANTE) ---
+    // Tratamento de Token
     let rawToken = process.env.HEADOFFICE_JWT || "";
-    
-    // 1. Remove espaços extras no começo e fim
     rawToken = rawToken.trim();
-    
-    // 2. Remove aspas se o usuário tiver colocado (ex: "eyJ...")
-    if (rawToken.startsWith('"') && rawToken.endsWith('"')) {
-        rawToken = rawToken.slice(1, -1);
-    }
+    if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
 
-    // 3. Garante que o header Authorization esteja correto (evita "Bearer Bearer")
-    // Se o usuário já colou "Bearer eyJ...", usamos como está. Se colou só "eyJ...", adicionamos o Bearer.
-    const authHeader = rawToken.toLowerCase().startsWith('bearer ') 
-        ? rawToken 
-        : `Bearer ${rawToken}`;
+    // LOG DE DEBUG (Aparecerá nos logs da Vercel)
+    console.log(`[DEBUG] Tentando resumir: ${nome}`);
+    console.log(`[DEBUG] Token Configurado? ${rawToken ? 'SIM' : 'NÃO'}`);
+    console.log(`[DEBUG] Início do Token: ${rawToken.substring(0, 15)}...`); 
 
-    // CHECK DE SEGURANÇA
+    // Monta o Header
+    const authHeader = rawToken.toLowerCase().startsWith('bearer ') ? rawToken : `Bearer ${rawToken}`;
+
     if (!rawToken || rawToken.length < 20) {
-        console.error("Token parece inválido ou curto demais:", rawToken);
-        return res.status(500).json({ error: "HEADOFFICE_JWT inválido ou não configurado na Vercel." });
+        return res.status(500).json({ error: "Token JWT inválido ou muito curto." });
     }
 
     let step = "Início";
 
     try {
-        // --- PASSO 1: Descobrir o Link ---
+        // PASSO 1: Descobrir Link
         step = "Buscando Link na Planilha";
-        
         const linkResponse = await axios.get(`${BASE_URL}/openai/question`, {
             params: {
                 aiName: 'Roger', 
                 context: `Planilha: ${SHEET_FULL_URL}`,
-                question: `Qual é a URL do documento (Link Docs) da empresa "${nome}"? Retorne APENAS a URL, sem texto.`
+                question: `Qual é a URL do documento (Link Docs) da empresa "${nome}"? Retorne APENAS a URL.`
             },
-            headers: { 'Authorization': authHeader } // Usa o header tratado
+            headers: { 'Authorization': authHeader }
         });
 
         const answerLink = linkResponse.data.answer || "";
         const urlMatch = answerLink.match(/(https?:\/\/[^\s]+)/);
         const docUrl = urlMatch ? urlMatch[0] : null;
 
-        if (!docUrl) {
-            return res.json({ success: false, error: `Link da empresa "${nome}" não encontrado na planilha.` });
-        }
+        if (!docUrl) return res.json({ success: false, error: `Link não encontrado na planilha para ${nome}. IA respondeu: ${answerLink}` });
 
-        // --- PASSO 2: Resumir o Documento ---
-        step = "Lendo Documento Encontrado";
-        
+        // PASSO 2: Resumir
+        step = "Lendo Documento";
         const summaryResponse = await axios.get(`${BASE_URL}/openai/question`, {
             params: {
                 aiName: 'Roger',
                 context: `Documento: ${docUrl}`,
-                question: `Leia a ÚLTIMA sessão (data mais recente). Retorne JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico", "status_projeto": "Em Dia/Atrasado"}`
+                question: `Leia a ÚLTIMA sessão. JSON: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico", "status_projeto": "Em Dia/Atrasado"}`
             },
             headers: { 'Authorization': authHeader }
         });
 
-        // --- TRATAMENTO ---
+        // Parse e Salvar
         let result = {};
         const answerRaw = summaryResponse.data.answer || "";
-        
         try {
             const cleanJson = answerRaw.replace(/```json/g, '').replace(/```/g, '').trim();
             result = JSON.parse(cleanJson);
         } catch (e) {
-            result = { 
-                resumo: answerRaw.substring(0, 400), 
-                status_cliente: "Erro Leitura",
-                status_projeto: "Erro Leitura" 
-            };
+            result = { resumo: answerRaw.substring(0, 400), status_cliente: "Erro Leitura", status_projeto: "Erro Leitura" };
         }
 
-        // --- SALVAR NO BANCO ---
         const updatePayload = {
             doc_link: docUrl,
             resumo: result.resumo,
@@ -129,17 +110,22 @@ app.post('/api/resumir-empresa', async (req, res) => {
         };
 
         await supabase.from('empresas').update(updatePayload).eq('id', id);
-
         res.json({ success: true, data: updatePayload });
 
     } catch (error) {
-        console.error(`Erro no passo [${step}]:`, error.message);
-        
-        const errorMsg = error.response 
-            ? `Erro API HeadOffice (${error.response.status}): ${JSON.stringify(error.response.data)}` 
-            : error.message;
-
-        res.status(500).json({ error: "Falha no processamento", step, details: errorMsg });
+        console.error(`[ERRO FATAL] Passo: ${step}`);
+        if (error.response) {
+            console.error(`[ERRO API] Status: ${error.response.status}`);
+            console.error(`[ERRO BODY]`, JSON.stringify(error.response.data));
+            
+            // Retorna o erro exato da HeadOffice para o frontend
+            return res.status(500).json({ 
+                error: "Erro de Token/API", 
+                step, 
+                details: `API respondeu ${error.response.status}: ${JSON.stringify(error.response.data)}` 
+            });
+        }
+        res.status(500).json({ error: "Erro interno", step, details: error.message });
     }
 });
 
@@ -182,10 +168,8 @@ const DASHBOARD_HTML = `
                 </button>
             </div>
         </header>
-
         <div id="grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6"></div>
     </div>
-
     <script>
         lucide.createIcons();
         const starContainer = document.getElementById('starsContainer');
@@ -195,7 +179,6 @@ const DASHBOARD_HTML = `
             s.style.width=Math.random()*2+'px'; s.style.height=s.style.width;
             s.style.animationDuration=(Math.random()*3+2)+'s'; starContainer.appendChild(s);
         }
-
         async function loadCompanies() {
             const grid = document.getElementById('grid');
             grid.innerHTML = '<div class="col-span-4 text-center text-slate-500 animate-pulse">Carregando...</div>';
@@ -228,7 +211,6 @@ const DASHBOARD_HTML = `
                 lucide.createIcons();
             } catch (e) { grid.innerHTML = '<div class="text-red-400">Erro.</div>'; }
         }
-
         async function summarize(nome, id) {
             const btn = document.getElementById('btn-' + id);
             const originalText = btn.innerHTML;
@@ -245,7 +227,6 @@ const DASHBOARD_HTML = `
             } catch (e) { alert('Erro conexão.'); btn.innerHTML = 'Falha'; } 
             finally { setTimeout(() => { btn.disabled = false; if(btn.innerHTML === 'Falha') btn.innerHTML = originalText; }, 2000); }
         }
-
         async function addCompany() {
             const input = document.getElementById('newCompanyInput');
             const nome = input.value.trim();
