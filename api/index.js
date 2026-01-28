@@ -49,25 +49,34 @@ function splitText(text, chunkSize) {
     return chunks;
 }
 
-// --- ROTA DE RESUMO COM CONTINUIDADE (CHAINING) ---
+// --- ROTA DE RESUMO (SEM BEARER + ANÁLISE CONTÍNUA) ---
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     
-    // Tratamento de Token
+    // --- AUTENTICAÇÃO LIMPA ---
+    // Busca HEADOFFICE_API_KEY ou HEADOFFICE_JWT
     const TOKEN_DE_EMERGENCIA = ""; 
-    let rawToken = TOKEN_DE_EMERGENCIA || process.env.HEADOFFICE_JWT || "";
+    let rawToken = TOKEN_DE_EMERGENCIA || process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
+    
+    // Limpeza rigorosa
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
-    if (rawToken.toLowerCase().startsWith('bearer ')) rawToken = rawToken.substring(7).trim();
     
+    // REMOVE O 'Bearer ' SE EXISTIR (Para enviar só a chave)
+    if (rawToken.toLowerCase().startsWith('bearer ')) {
+        rawToken = rawToken.substring(7).trim();
+    }
+    
+    // AuthHeader é APENAS o código da chave/token
     const authHeader = rawToken;
-    if (rawToken.length < 20) return res.status(500).json({ error: "Token JWT inválido." });
+
+    if (rawToken.length < 10) return res.status(500).json({ error: "API Key/Token inválido ou não configurado." });
 
     let step = "Início";
     let docUrl = null;
 
     try {
-        // 1. Encontrar Link
+        // 1. Encontrar Link (CSV)
         step = "Buscando Link no CSV";
         try {
             const csvResponse = await axios.get(SHEET_CSV_URL);
@@ -82,13 +91,14 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
         if (!docUrl) {
             // Fallback IA
+            step = "Buscando Link via IA";
             const aiSearch = await axios.get(`${BASE_URL}/openai/question`, {
                 params: {
                     aiName: 'Roger', 
                     context: `Planilha: ${SHEET_FULL_URL}`,
                     question: `Encontre a empresa "${nome}". Extraia a URL do Docs.`
                 },
-                headers: { 'Authorization': authHeader }
+                headers: { 'Authorization': authHeader } // Envia só a chave
             });
             const answerAI = aiSearch.data.answer || "";
             const matchAI = answerAI.match(/(https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+)/);
@@ -104,6 +114,10 @@ app.post('/api/resumir-empresa', async (req, res) => {
         try {
             const textResponse = await axios.get(txtUrl);
             fullText = typeof textResponse.data === 'string' ? textResponse.data : JSON.stringify(textResponse.data);
+            
+            if (fullText.includes("<!DOCTYPE html>") || fullText.includes("Google Accounts")) {
+                return res.json({ success: false, error: "Doc privado. Libere para 'Qualquer pessoa com o link'." });
+            }
         } catch (downloadError) {
             return res.json({ success: false, error: "Falha ao baixar texto do Doc." });
         }
@@ -111,25 +125,22 @@ app.post('/api/resumir-empresa', async (req, res) => {
         // 3. ESTRATÉGIA "MEMÓRIA EM CADEIA" (Chain)
         step = "Análise Contínua";
         
-        // Focamos nos últimos 15.000 chars para ser relevante, mas processamos em ordem
+        // Analisa os últimos 15.000 caracteres
         const relevantText = fullText.slice(-15000); 
         
-        // Pedaços de 1.500 caracteres (seguro para URL)
+        // Pedaços de 1.500 caracteres (Seguro para GET)
         const chunks = splitText(relevantText, 1500);
         console.log(`[CHAIN] Analisando ${chunks.length} partes em sequência...`);
 
-        // Variável que guarda a "Memória" da IA entre os passos
         let currentMemory = "Início da análise. Nenhum evento relevante ainda.";
 
-        // Loop Sequencial (Não paralelo, para manter a ordem)
+        // Loop Sequencial
         for (let i = 0; i < chunks.length; i++) {
             const chunk = chunks[i];
             const isLast = i === chunks.length - 1;
             
-            // Para não estourar a URL, cortamos a memória anterior se estiver gigante
             const safeMemory = currentMemory.length > 500 ? currentMemory.substring(0, 500) + "..." : currentMemory;
 
-            // Se for o último chunk, pedimos o JSON final. Se for meio, pedimos atualização de contexto.
             const prompt = isLast 
                 ? `Esta é a PARTE FINAL. Baseado na memória anterior e neste texto final, gere o status definitivo. JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico/Neutro", "status_projeto": "Em Dia/Atrasado"}`
                 : `Atualize o cenário. O que aconteceu de novo neste trecho? Mantenha o sentimento atualizado. Seja breve (max 300 chars).`;
@@ -138,30 +149,25 @@ app.post('/api/resumir-empresa', async (req, res) => {
             const response = await axios.get(`${BASE_URL}/openai/question`, {
                 params: {
                     aiName: 'Roger',
-                    // AQUI ESTÁ O TRUQUE: Passamos o resumo anterior + o novo texto
                     context: `MEMÓRIA ATÉ AGORA: ${safeMemory}\n\nNOVO TRECHO DA CONVERSA:\n${chunk}`,
                     question: prompt
                 },
-                headers: { 'Authorization': authHeader }
+                headers: { 'Authorization': authHeader } // AQUI: Só a chave, sem Bearer
             });
 
-            // Atualiza a memória com a resposta da IA para usar no próximo passo
             currentMemory = response.data.answer || currentMemory;
-            console.log(`[PASSO ${i+1}/${chunks.length}] Memória atualizada.`);
         }
 
         // 4. FINALIZAÇÃO
         step = "Processando Resultado Final";
         let result = {};
-        
-        // A última resposta da IA (currentMemory) já deve ser o JSON porque o prompt mudou no último passo
         let finalAnswer = currentMemory.replace(/```json/g, '').replace(/```/g, '').trim();
 
         try {
             result = JSON.parse(finalAnswer);
         } catch (e) {
             console.error("[PARSE ERROR]", finalAnswer);
-            // Se falhar o parse, força uma última chamada só para formatar
+            // Fallback formatação
             try {
                 const formatResponse = await axios.get(`${BASE_URL}/openai/question`, {
                     params: {
