@@ -52,10 +52,13 @@ app.post('/api/resumir-empresa', async (req, res) => {
     console.log(`[DEBUG] Token Configurado? ${rawToken ? 'SIM' : 'NÃO'}`);
     console.log(`[DEBUG] Início do Token: ${rawToken.substring(0, 15)}...`); 
 
-    // Monta o Header
-    const authHeader = rawToken.toLowerCase().startsWith('bearer ') ? rawToken : `Bearer ${rawToken}`;
+    // Monta o Header, removendo "Bearer" se existir
+    let authHeader = rawToken;
+    if (authHeader.toLowerCase().startsWith('bearer ')) {
+        authHeader = authHeader.slice(7).trim();
+    }
 
-    if (!rawToken || rawToken.length < 20) {
+    if (!authHeader || authHeader.length < 20) {
         return res.status(500).json({ error: "Token JWT inválido ou muito curto." });
     }
 
