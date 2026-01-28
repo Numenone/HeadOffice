@@ -15,192 +15,162 @@ const supabase = createClient(
     process.env.SUPABASE_KEY || ''
 );
 
-// URL Base (Sem barra no final)
 const BASE_URL = 'https://api.headoffice.ai/v1';
-
-// Dados da Planilha Alvo
-const SHEET_ID = '1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM';
 const SHEET_FULL_URL = 'https://docs.google.com/spreadsheets/d/1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM/edit?gid=0#gid=0';
 
-// --- ROTA 1: DASHBOARD ---
+// --- ROTA 1: DASHBOARD (Frontend) ---
 app.get('/', (req, res) => {
     const currentUrl = `https://${req.headers.host}`;
     const htmlComUrl = DASHBOARD_HTML.replace('https://head-office-one.vercel.app', currentUrl);
     res.send(htmlComUrl);
 });
 
-// --- ROTA 2: DADOS ---
-app.get('/api/dashboard-data', async (req, res) => {
-    try {
-        const { data, error } = await supabase.from('sessoes_resumos').select('*').order('last_updated', { ascending: false });
-        if (error) throw error;
-        res.json(data);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+// --- ROTA 2: LISTAR EMPRESAS ---
+app.get('/api/empresas', async (req, res) => {
+    const { data, error } = await supabase.from('empresas').select('*').order('nome', { ascending: true });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data);
 });
 
-// --- ROTA 3: SYNC AGENT (AJUSTADO PARA GET) ---
-app.get('/api/sync-agent', async (req, res) => {
-    let step = "Início";
+// --- ROTA 3: CRIAR NOVA EMPRESA ---
+app.post('/api/empresas', async (req, res) => {
+    const { nome } = req.body;
+    if (!nome) return res.status(400).json({ error: "Nome obrigatório" });
+    
+    const { data, error } = await supabase.from('empresas').insert([{ nome }]).select();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ success: true, data });
+});
+
+// --- ROTA 4: RESUMIR UMA EMPRESA (O Cérebro) ---
+app.post('/api/resumir-empresa', async (req, res) => {
+    const { nome, id } = req.body;
+    const HEADOFFICE_API_KEY = process.env.HEADOFFICE_API_KEY;
+    
     try {
-        const HEADOFFICE_API_KEY = process.env.HEADOFFICE_API_KEY;
-        if (!HEADOFFICE_API_KEY) throw new Error("Falta a HEADOFFICE_API_KEY no .env");
-
-        // PASSO 1: Buscar na Store (GET)
-        step = "Consultando Planilha (/google-sheets/search-store)";
-        try {
-            await axios.get(`${BASE_URL}/google-sheets/search-store`, {
-                params: {
-                    search: SHEET_ID,
-                    page: 1,
-                    pageSize: 10
-                },
-                headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` }
-            });
-        } catch (e) {
-            console.warn("Aviso: Falha na busca search-store.", e.message);
-        }
-
-        // PASSO 2: Pegar Links da Planilha (GET)
-        step = "Extraindo Links (/openai/question)";
-        
-        // MUDANÇA CRÍTICA: axios.get com params
-        const linksQuery = await axios.get(`${BASE_URL}/openai/question`, {
-            params: {
-                // Passamos a URL para a IA entender o contexto
-                context: `Planilha Google Sheets: ${SHEET_FULL_URL}`,
-                question: `Liste APENAS as URLs encontradas na coluna "Links Docs". Retorne JSON Array puro: ["url1", "url2"].`
-            },
-            headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` }
-        });
-
-        let linksDocs = [];
-        const answerText = linksQuery.data.answer || "";
-        
-        try {
-            const cleanJson = answerText.replace(/```json/g, '').replace(/```/g, '').trim();
-            linksDocs = JSON.parse(cleanJson);
-        } catch (e) {
-            const urlRegex = /(https?:\/\/[^\s,\]"]+)/g;
-            linksDocs = answerText.match(urlRegex) || [];
-        }
-
-        if (!Array.isArray(linksDocs) || linksDocs.length === 0) {
-            return res.json({ 
-                success: false, 
-                message: "Não foi possível extrair links da planilha.", 
-                debug_ia: answerText 
-            });
-        }
-
-        // PASSO 3: Ler Conteúdo de Cada Link (GET)
-        step = "Lendo Documentos Individuais";
-        const results = [];
-
-        for (const link of linksDocs) {
-            const { data: existing } = await supabase.from('sessoes_resumos').select('id').eq('doc_link', link).single();
-            if (existing) continue;
-
-            const promptAnalise = `
-                Identifique a ÚLTIMA data/sessão neste documento e resuma.
-                JSON estrito:
-                {
-                    "nome_cliente": "Nome",
-                    "resumo_ultima_sessao": "Resumo",
-                    "pontos_importantes": "Top 3 pontos",
-                    "status_cliente": "Satisfeito/Crítico",
-                    "status_projeto": "Andamento/Atrasado"
-                }
-            `;
-
-            // MUDANÇA CRÍTICA: axios.get com params
-            const docResponse = await axios.get(`${BASE_URL}/openai/question`, {
-                params: {
-                    context: `Link do Documento: ${link}`, // Enviamos o link, a API deve fazer o fetch interno
-                    question: promptAnalise
-                },
-                headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` }
-            });
-
-            let parsed = {};
-            try {
-                const raw = docResponse.data.answer.replace(/```json/g, '').replace(/```/g, '');
-                parsed = JSON.parse(raw);
-            } catch (e) {
-                parsed = { 
-                    resumo_ultima_sessao: docResponse.data.answer ? docResponse.data.answer.substring(0, 300) : "Sem resposta da IA", 
-                    status_cliente: "Erro Leitura", 
-                    status_projeto: "Indefinido",
-                    nome_cliente: "Cliente"
-                };
+        // 1. Prompt para localizar o link E resumir (tudo em um para economizar chamadas)
+        // Isso evita timeout pois focamos em um único alvo.
+        const prompt = `
+            Contexto: Planilha Google Sheets (${SHEET_FULL_URL}).
+            
+            TAREFA 1: Encontre a linha correspondente à empresa "${nome}".
+            TAREFA 2: Pegue a URL na coluna "Links Docs" (ou Link Docs) dessa linha.
+            TAREFA 3: ACESSE essa URL (Documento Google Docs) e leia a ÚLTIMA sessão registrada.
+            
+            Retorne JSON estrito:
+            {
+                "doc_link_encontrado": "A url que você achou (ou null)",
+                "resumo": "Resumo executivo da última sessão",
+                "pontos_importantes": "Top 3 pontos de atenção",
+                "status_cliente": "Satisfeito / Crítico / Neutro",
+                "status_projeto": "Em Dia / Atrasado / Bug"
             }
+        `;
 
-            const { data: saved } = await supabase.from('sessoes_resumos').upsert({
-                doc_link: link,
-                nome_cliente: parsed.nome_cliente || "Cliente",
-                resumo_ultima_sessao: parsed.resumo_ultima_sessao,
-                pontos_discussao: parsed.pontos_discussao || parsed.pontos_importantes || "",
-                status_cliente: parsed.status_cliente || "Neutro",
-                status_projeto: parsed.status_projeto || "Em Análise",
-                last_updated: new Date()
-            }).select().single();
+        // Usamos POST /comunication (suporta mais tokens de entrada/saída)
+        const response = await axios.post(`${BASE_URL}/openai/comunication`, {
+            context: `Você é um Analista de Projetos focado na empresa: ${nome}`,
+            message: prompt
+        }, { headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` } });
 
-            if (saved) results.push(saved);
+        // Tratamento da resposta
+        let result = {};
+        const answerRaw = response.data.answer || response.data.message || "";
+        
+        try {
+            const cleanJson = answerRaw.replace(/```json/g, '').replace(/```/g, '').trim();
+            result = JSON.parse(cleanJson);
+        } catch (e) {
+            result = { 
+                resumo: answerRaw.substring(0, 500), 
+                status_cliente: "Erro Leitura",
+                status_projeto: "Erro Leitura" 
+            };
         }
 
-        res.json({ success: true, count: results.length, data: results });
+        // Atualizar no Banco
+        const updatePayload = {
+            resumo: result.resumo,
+            pontos_importantes: result.pontos_importantes,
+            status_cliente: result.status_cliente || "Neutro",
+            status_projeto: result.status_projeto || "Em Análise",
+            last_updated: new Date()
+        };
+        
+        if (result.doc_link_encontrado) {
+            updatePayload.doc_link = result.doc_link_encontrado;
+        }
+
+        const { error } = await supabase
+            .from('empresas')
+            .update(updatePayload)
+            .eq('id', id);
+
+        if (error) throw error;
+
+        res.json({ success: true, data: updatePayload });
 
     } catch (error) {
-        console.error(`Erro no passo [${step}]:`, error.message);
-        
-        const errorDetail = error.response 
-            ? `Status ${error.response.status} - ${JSON.stringify(error.response.data)}` 
-            : error.message;
-
+        console.error("Erro ao resumir:", error.message);
         res.status(500).json({ 
-            error: "Falha na API HeadOffice.", 
-            step_failed: step,
-            details: errorDetail
+            error: "Falha ao processar empresa", 
+            details: error.response ? error.response.data : error.message 
         });
     }
 });
 
 module.exports = app;
 
-// --- DASHBOARD HTML (Visualização) ---
+// --- FRONTEND (Dashboard) ---
 const DASHBOARD_HTML = `
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IAgente Monitor - HeadOffice</title>
+    <title>IAgente Monitor - Empresas</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <style>
         body { font-family: 'Inter', sans-serif; background-color: #0B0C15; color: #E2E8F0; }
+        .glass { background: rgba(30, 41, 59, 0.4); backdrop-filter: blur(12px); border: 1px solid rgba(148, 163, 184, 0.1); }
         .stars { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: -1; pointer-events: none; }
         .star { position: absolute; background: white; border-radius: 50%; animation: twinkle infinite ease-in-out; }
         @keyframes twinkle { 0%, 100% { opacity: 0.2; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1.2); } }
-        .glass { background: rgba(30, 41, 59, 0.4); backdrop-filter: blur(12px); border: 1px solid rgba(148, 163, 184, 0.1); }
+        
+        /* Status Colors */
+        .status-Satisfeito, .status-EmDia { color: #4ade80; background: rgba(74, 222, 128, 0.1); border-color: rgba(74, 222, 128, 0.2); }
+        .status-Crítico, .status-Atrasado, .status-Bug { color: #f87171; background: rgba(248, 113, 113, 0.1); border-color: rgba(248, 113, 113, 0.2); }
+        .status-Neutro, .status-Aguardando { color: #94a3b8; background: rgba(148, 163, 184, 0.1); border-color: rgba(148, 163, 184, 0.2); }
     </style>
 </head>
 <body class="min-h-screen p-6 md:p-12">
     <script>const API_URL = 'https://head-office-one.vercel.app';</script>
     <div class="stars" id="starsContainer"></div>
+    
     <div class="max-w-7xl mx-auto">
-        <header class="flex justify-between items-center mb-12">
-            <h1 class="text-3xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-pink-400">IAgente Monitor</h1>
-            <button onclick="syncAgent()" id="btnSync" class="glass px-6 py-3 rounded-xl flex items-center gap-2 hover:bg-white/5 transition-all text-sm font-bold cursor-pointer">
-                <i data-lucide="zap" id="iconSync"></i> <span id="txtSync">Analisar Planilha</span>
-            </button>
+        <header class="flex flex-col md:flex-row justify-between items-center mb-8 gap-4">
+            <div>
+                <h1 class="text-3xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-pink-400">IAgente Empresas</h1>
+                <p class="text-xs text-slate-500 mt-1">Gerenciamento Individual</p>
+            </div>
+            
+            <div class="flex gap-2">
+                <input type="text" id="newCompanyInput" placeholder="Nome da nova empresa..." class="glass px-4 py-2 rounded-lg text-sm text-white focus:outline-none focus:border-indigo-500">
+                <button onclick="addCompany()" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-bold transition-all flex items-center gap-2">
+                    <i data-lucide="plus-circle" class="w-4 h-4"></i> Adicionar
+                </button>
+            </div>
         </header>
-        <div id="statusMsg" class="hidden mb-8 p-4 rounded-xl text-center text-sm font-mono break-all"></div>
-        <div id="cardsGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"></div>
+
+        <div id="grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+            </div>
     </div>
+
     <script>
         lucide.createIcons();
+        
+        // Estrelas
         const starContainer = document.getElementById('starsContainer');
         for(let i=0; i<60; i++) {
             const s = document.createElement('div'); s.className='star';
@@ -209,75 +179,121 @@ const DASHBOARD_HTML = `
             s.style.animationDuration=(Math.random()*3+2)+'s'; starContainer.appendChild(s);
         }
 
-        function render(data) {
-            const grid = document.getElementById('cardsGrid'); grid.innerHTML = '';
-            if(!data || !data.length) { grid.innerHTML = '<div class="col-span-3 text-center py-20 glass rounded-2xl text-slate-400">Nenhuma análise encontrada. Clique em Analisar Planilha.</div>'; return; }
-            data.forEach(item => {
-                grid.innerHTML += \`
-                <div class="glass rounded-2xl p-6 flex flex-col gap-4 relative overflow-hidden group hover:border-indigo-500/30 transition-all">
-                    <div class="flex justify-between items-start">
-                        <div>
-                            <h2 class="font-bold text-white text-lg">\${item.nome_cliente || 'Cliente'}</h2>
-                            <a href="\${item.doc_link}" target="_blank" class="text-xs text-purple-400 hover:text-white flex items-center gap-1 mt-1"><i data-lucide="external-link" class="w-3 h-3"></i> Link Doc</a>
-                        </div>
-                        <span class="text-[10px] bg-white/5 px-2 py-1 rounded text-slate-500">\${new Date(item.last_updated).toLocaleDateString()}</span>
-                    </div>
-                    
-                    <div class="grid grid-cols-2 gap-3">
-                        <div class="bg-indigo-500/10 border border-indigo-500/20 p-2 rounded text-center">
-                            <span class="text-[10px] text-indigo-300 uppercase font-bold block mb-1">Cliente</span>
-                            <span class="text-xs text-white">\${item.status_cliente}</span>
-                        </div>
-                        <div class="bg-pink-500/10 border border-pink-500/20 p-2 rounded text-center">
-                            <span class="text-[10px] text-pink-300 uppercase font-bold block mb-1">Projeto</span>
-                            <span class="text-xs text-white">\${item.status_projeto}</span>
-                        </div>
-                    </div>
+        // --- FUNÇÕES ---
 
-                    <div>
-                        <h3 class="text-xs font-bold text-slate-400 mb-1 uppercase tracking-wide">Resumo Última Sessão</h3>
-                        <p class="text-sm text-slate-300 leading-relaxed font-light bg-black/20 p-3 rounded-lg border border-white/5">\${item.resumo_ultima_sessao}</p>
-                    </div>
+        async function loadCompanies() {
+            const grid = document.getElementById('grid');
+            grid.innerHTML = '<div class="col-span-4 text-center text-slate-500 animate-pulse">Carregando empresas...</div>';
+            
+            try {
+                const res = await fetch(API_URL + '/api/empresas');
+                const data = await res.json();
+                
+                grid.innerHTML = '';
+                if(data.length === 0) {
+                    grid.innerHTML = '<div class="col-span-4 text-center text-slate-500">Nenhuma empresa cadastrada.</div>';
+                    return;
+                }
 
-                    <div class="mt-auto">
-                        <h3 class="text-xs font-bold text-yellow-500 mb-1 flex items-center gap-1"><i data-lucide="alert-triangle" class="w-3 h-3"></i> Pontos de Atenção</h3>
-                        <p class="text-xs text-slate-400">\${item.pontos_discussao}</p>
+                data.forEach(emp => {
+                    // Status Class Normalization
+                    const sCli = (emp.status_cliente || '').replace(/\s/g, '');
+                    const sProj = (emp.status_projeto || '').replace(/\s/g, '');
+
+                    grid.innerHTML += \`
+                    <div class="glass rounded-xl p-5 flex flex-col gap-3 group relative overflow-hidden transition-all hover:border-indigo-500/40" id="card-\${emp.id}">
+                        
+                        <div class="flex justify-between items-start">
+                            <h2 class="font-bold text-white truncate text-lg w-full" title="\${emp.nome}">\${emp.nome}</h2>
+                            \${emp.doc_link ? \`<a href="\${emp.doc_link}" target="_blank" class="text-slate-500 hover:text-white"><i data-lucide="external-link" class="w-4 h-4"></i></a>\` : ''}
+                        </div>
+
+                        <div class="flex gap-2 text-[10px] font-bold uppercase">
+                            <span class="px-2 py-1 rounded border status-\${sCli}">\${emp.status_cliente || 'PENDENTE'}</span>
+                            <span class="px-2 py-1 rounded border status-\${sProj}">\${emp.status_projeto || '-'}</span>
+                        </div>
+
+                        <div class="bg-black/20 rounded-lg p-3 min-h-[80px] text-xs text-slate-300 leading-relaxed border border-white/5">
+                            \${emp.resumo || '<span class="italic opacity-50">Sem resumo. Clique no botão abaixo para analisar.</span>'}
+                        </div>
+
+                        <button onclick="summarize('\${emp.nome}', \${emp.id})" id="btn-\${emp.id}" class="mt-auto w-full bg-white/5 hover:bg-indigo-600/80 hover:text-white text-slate-300 py-2 rounded-lg text-xs font-bold transition-all flex justify-center items-center gap-2 border border-white/10">
+                            <i data-lucide="sparkles" class="w-3 h-3"></i> 
+                            \${emp.resumo ? 'Atualizar Resumo' : 'Gerar Resumo'}
+                        </button>
                     </div>
-                </div>\`;
-            });
-            lucide.createIcons();
+                    \`;
+                });
+                lucide.createIcons();
+
+            } catch (e) {
+                grid.innerHTML = '<div class="text-red-400">Erro ao carregar empresas.</div>';
+                console.error(e);
+            }
         }
 
-        async function fetchD() { try { const res = await fetch(API_URL+'/api/dashboard-data'); const json = await res.json(); render(json); } catch(e){} }
+        async function summarize(nome, id) {
+            const btn = document.getElementById('btn-' + id);
+            const originalText = btn.innerHTML;
+            
+            // Estado de Loading no Card
+            btn.disabled = true;
+            btn.innerHTML = '<i data-lucide="loader-2" class="animate-spin w-3 h-3"></i> Lendo Doc...';
+            lucide.createIcons();
 
-        async function syncAgent() {
-            const btn = document.getElementById('btnSync'); const msg = document.getElementById('statusMsg');
-            const icon = document.getElementById('iconSync');
-            
-            btn.disabled=true; btn.classList.add('opacity-50'); icon.classList.add('animate-spin');
-            msg.innerHTML = "📡 Conectando ao Google Sheets e analisando documentos...<br>Isso pode levar até 1 minuto."; 
-            msg.className="mb-8 p-4 rounded-xl bg-blue-500/10 text-blue-300 block";
-            
-            try { 
-                const res = await fetch(API_URL+'/api/sync-agent'); 
+            try {
+                const res = await fetch(API_URL + '/api/resumir-empresa', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ nome, id })
+                });
+                const json = await res.json();
+
+                if (json.success) {
+                    // Atualiza apenas este card recarregando a lista (ou poderia atualizar o DOM direto)
+                    // Para simplicidade e garantir dados frescos:
+                    loadCompanies(); 
+                } else {
+                    alert('Erro: ' + (json.details || json.error));
+                    btn.innerHTML = 'Erro ⚠️';
+                }
+            } catch (e) {
+                console.error(e);
+                alert('Erro de conexão.');
+                btn.innerHTML = 'Falha';
+            } finally {
+                setTimeout(() => {
+                     btn.disabled = false;
+                     if(btn.innerHTML === 'Falha') btn.innerHTML = originalText;
+                }, 2000);
+            }
+        }
+
+        async function addCompany() {
+            const input = document.getElementById('newCompanyInput');
+            const nome = input.value.trim();
+            if(!nome) return;
+
+            try {
+                const res = await fetch(API_URL + '/api/empresas', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ nome })
+                });
                 const json = await res.json();
                 
-                if(json.success) { 
-                    msg.innerHTML = \`✅ Sucesso! \${json.count} sessões analisadas.\`; 
-                    msg.className="mb-8 p-4 rounded-xl bg-emerald-500/10 text-emerald-300 block";
-                    fetchD(); 
-                } else { 
-                    msg.innerHTML = "⚠️ " + (json.message || json.error) + (json.details ? "<br><span class='text-xs opacity-70'>" + json.details + "</span>" : ""); 
-                    msg.className="mb-8 p-4 rounded-xl bg-red-500/10 text-red-300 block";
+                if(json.success) {
+                    input.value = '';
+                    loadCompanies();
+                } else {
+                    alert('Erro ao criar: ' + json.error);
                 }
-            } catch(e) { 
-                msg.innerHTML = "❌ Erro Fatal: " + e.message; 
-                msg.className="mb-8 p-4 rounded-xl bg-red-500/10 text-red-300 block"; 
-            }
-            
-            btn.disabled=false; btn.classList.remove('opacity-50'); icon.classList.remove('animate-spin');
+            } catch(e) { console.error(e); }
         }
-        fetchD();
+
+        // Iniciar
+        loadCompanies();
     </script>
 </body>
 </html>
+`;
