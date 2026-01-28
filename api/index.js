@@ -17,8 +17,9 @@ const supabase = createClient(
 );
 
 const BASE_URL = 'https://api.headoffice.ai/v1';
-// ID da Planilha Mestra
-const SPREADSHEET_ID = '1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM';
+const SHEET_ID = '1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM';
+const SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=0`;
+const SHEET_FULL_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`;
 
 // ID DO BOT ROGER
 const BOT_ID = '69372353b11d9df606b68bf8';
@@ -31,7 +32,21 @@ app.get('/', (req, res) => {
     res.send(htmlComUrl);
 });
 
-// --- HELPER AUTH GOOGLE (GCP) ---
+// --- HELPER AUTH HEADOFFICE (SEM BEARER) ---
+function getHeadOfficeToken() {
+    let rawToken = process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
+    rawToken = rawToken.trim();
+    if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
+    
+    // REMOÇÃO ESTRITA DO BEARER
+    if (rawToken.toLowerCase().startsWith('bearer ')) {
+        rawToken = rawToken.substring(7).trim();
+    }
+    
+    return rawToken.length > 10 ? rawToken : null;
+}
+
+// --- HELPER AUTH GOOGLE (DOCS APENAS) ---
 function getGoogleAuth() {
     const privateKey = process.env.GOOGLE_PRIVATE_KEY 
         ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') 
@@ -46,54 +61,11 @@ function getGoogleAuth() {
             client_email: process.env.GOOGLE_CLIENT_EMAIL,
             private_key: privateKey,
         },
-        // Escopos para Ler Planilhas e Documentos
-        scopes: [
-            'https://www.googleapis.com/auth/documents.readonly',
-            'https://www.googleapis.com/auth/spreadsheets.readonly'
-        ],
+        scopes: ['https://www.googleapis.com/auth/documents.readonly'],
     });
 }
 
-// --- HELPER: BUSCAR URL NA PLANILHA (VIA API) ---
-async function findDocUrlInSheet(companyName) {
-    const auth = getGoogleAuth();
-    const client = await auth.getClient();
-    const sheets = google.sheets({ version: 'v4', auth: client });
-
-    // Lê todas as linhas da Aba 1 (assumindo que é a primeira)
-    const res = await sheets.spreadsheets.values.get({
-        spreadsheetId: SPREADSHEET_ID,
-        range: 'A:Z', // Lê colunas de A a Z
-    });
-
-    const rows = res.data.values;
-    if (!rows || rows.length === 0) return null;
-
-    // Cabeçalho está na linha 0. Vamos descobrir qual coluna é "Empresa" e qual é "Link Docs"
-    const headers = rows[0].map(h => h.toLowerCase());
-    
-    // Tenta achar índices das colunas (flexível)
-    const idxNome = headers.findIndex(h => h.includes("empresa") || h.includes("nome") || h.includes("cliente"));
-    // Procura por "link", "url", "docs"
-    const idxLink = headers.findIndex(h => h.includes("link docs") || h.includes("url") || h.includes("documento"));
-
-    if (idxNome === -1 || idxLink === -1) {
-        throw new Error(`Não achei as colunas 'Empresa' e 'Link Docs' na planilha. Colunas encontradas: ${headers.join(', ')}`);
-    }
-
-    // Procura a empresa
-    for (let i = 1; i < rows.length; i++) {
-        const row = rows[i];
-        const rowCompany = row[idxNome];
-        
-        if (rowCompany && rowCompany.toLowerCase().trim() === companyName.toLowerCase().trim()) {
-            return row[idxLink]; // Retorna a URL encontrada
-        }
-    }
-    return null;
-}
-
-// --- HELPER: EXTRATOR UNIVERSAL DO DOCS (LÊ TUDO) ---
+// --- HELPER: EXTRATOR UNIVERSAL DO DOCS ---
 function readStructuralElements(elements) {
     let text = '';
     if (!elements) return text;
@@ -119,7 +91,7 @@ function readStructuralElements(elements) {
     return text;
 }
 
-// --- HELPER: LER DOCUMENTO (VIA API) ---
+// --- HELPER: LER DOCUMENTO (VIA API GOOGLE) ---
 async function getGoogleDocContent(docId) {
     try {
         const auth = getGoogleAuth();
@@ -129,23 +101,13 @@ async function getGoogleDocContent(docId) {
         console.log(`[GCP] Acessando Doc ID: ${docId}`);
         const res = await docs.documents.get({ documentId: docId });
         
-        // Extrai TODO o conteúdo
-        const fullText = readStructuralElements(res.data.body.content);
-        return fullText;
+        return readStructuralElements(res.data.body.content);
 
     } catch (error) {
-        if (error.code === 403) throw new Error(`Permissão negada no DOC. Compartilhe este doc específico com: ${process.env.GOOGLE_CLIENT_EMAIL}`);
+        if (error.code === 403) throw new Error(`Permissão negada no DOC. Compartilhe este doc com: ${process.env.GOOGLE_CLIENT_EMAIL}`);
         if (error.code === 404) throw new Error("Documento não encontrado (404). Link quebrado.");
         throw error;
     }
-}
-
-// --- HELPER AUTH HEADOFFICE ---
-function getHeadOfficeToken() {
-    let rawToken = process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
-    rawToken = rawToken.trim();
-    if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
-    return rawToken.length > 10 ? rawToken : null;
 }
 
 // --- HELPERS ÚTEIS ---
@@ -183,12 +145,12 @@ app.post('/api/empresas', async (req, res) => {
 });
 
 // ======================================================
-// LÓGICA DE INTELIGÊNCIA ARTIFICIAL (CS INTELLIGENCE V5 - FINAL)
+// LÓGICA DE INTELIGÊNCIA ARTIFICIAL (CS INTELLIGENCE V5)
 // ======================================================
 
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
-    const authHeader = getHeadOfficeToken();
+    const authHeader = getHeadOfficeToken(); // Token Limpo
 
     if (!authHeader) return res.status(500).json({ error: "Token HeadOffice inválido." });
 
@@ -197,44 +159,49 @@ app.post('/api/resumir-empresa', async (req, res) => {
     let docId = null;
 
     try {
-        // 1. BUSCAR LINK NA PLANILHA (USANDO API GOOGLE SHEETS)
-        step = "Consultando Planilha (Google Sheets API)";
+        // 1. BUSCAR LINK NO CSV (MÉTODO CLÁSSICO)
+        step = "Baixando CSV";
         try {
-            docUrl = await findDocUrlInSheet(nome);
+            const csvResponse = await axios.get(SHEET_CSV_URL);
+            const lines = csvResponse.data.split('\n');
             
-            if (docUrl) {
-                // Extrai ID do Doc
-                const match = docUrl.match(/(https:\/\/docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+))/);
-                if (match) docId = match[2];
+            for (const line of lines) {
+                // Verifica se a linha contém o nome da empresa
+                if (line.toLowerCase().includes(nome.toLowerCase())) {
+                    // Extrai link do Docs via Regex
+                    const match = line.match(/(https:\/\/docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+))/);
+                    if (match) { 
+                        docUrl = match[0]; 
+                        docId = match[2];
+                        break; 
+                    }
+                }
             }
-        } catch (sheetError) {
-            console.error("Erro Planilha:", sheetError.message);
-            return res.json({ success: false, error: `Erro ao ler planilha: ${sheetError.message}. Verifique se compartilhou a planilha com o robô.` });
-        }
+        } catch (e) { console.warn("Erro ao baixar CSV:", e.message); }
 
         if (!docUrl || !docId) {
-            return res.json({ success: false, error: `Empresa "${nome}" não encontrada na planilha ou sem link válido.` });
+            return res.json({ success: false, error: `Empresa "${nome}" não encontrada no CSV ou sem link válido.` });
         }
 
-        // 2. LER DOCUMENTO (USANDO API GOOGLE DOCS)
-        step = `Lendo Documento Completo`;
+        // 2. LER DOCUMENTO (VIA API GOOGLE)
+        step = `Lendo Google Docs`;
         let fullText = "";
         
         try {
             fullText = await getGoogleDocContent(docId);
             
             if (!fullText || fullText.trim().length < 20) {
-                return res.json({ success: false, error: "O documento foi acessado, mas está vazio." });
+                return res.json({ success: false, error: "O documento foi acessado via API, mas está vazio." });
             }
         } catch (apiError) {
-            console.error("Erro Docs:", apiError.message);
+            console.error("Erro Docs API:", apiError.message);
             return res.json({ success: false, error: apiError.message });
         }
 
-        // 3. PROCESSAMENTO DE INTELIGÊNCIA (CHAIN OF DENSITY)
+        // 3. PROCESSAMENTO DE INTELIGÊNCIA
         step = "Processamento Neural CS";
         
-        // Pega um contexto maior (30k caracteres)
+        // Contexto: 30k chars
         const relevantText = fullText.slice(-30000); 
         const chunks = splitText(relevantText, 4000); 
         console.log(`[CHAIN] Analisando ${chunks.length} blocos.`);
