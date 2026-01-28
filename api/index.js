@@ -20,6 +20,7 @@ const BASE_URL = 'https://api.headoffice.ai/v1';
 const SHEET_ID = '1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM';
 const SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=0`;
 
+// ID DO BOT ROGER
 const BOT_ID = '69372353b11d9df606b68bf8';
 const BOT_NAME = 'Roger';
 
@@ -36,14 +37,13 @@ function getHeadOfficeToken() {
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
     
-    // Remove "Bearer" para evitar erro 403
     if (rawToken.toLowerCase().startsWith('bearer')) {
         rawToken = rawToken.replace(/^bearer\s+/i, "").trim();
     }
     return rawToken.length > 10 ? rawToken : null;
 }
 
-// --- HELPER AUTH GOOGLE ---
+// --- HELPER AUTH GOOGLE (GCP) ---
 function getGoogleAuth() {
     const privateKey = process.env.GOOGLE_PRIVATE_KEY 
         ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') 
@@ -106,46 +106,34 @@ function extractJSON(text) {
     return text;
 }
 
-// --- INTELLIGENT TRIMMER (O SEGREDO PARA NÃO ESTOURAR 414) ---
-// Remove a parte da "Transcrição" e mantém apenas o resumo/pauta
+// --- TRIMMER PARA ECONOMIZAR TOKENS E EVITAR 414 ---
 function filterContentForAI(text) {
     if (!text) return "";
-
-    const lowerText = text.toLowerCase();
     
-    // Palavras que indicam o início da transcrição bruta (lixo para o resumo)
-    const stopWords = [
-        "transcrição", 
-        "transcription", 
-        "audio transcription", 
-        "gravação da reunião", 
-        "conversa na íntegra",
-        "transcript:"
-    ];
-
+    // Remove transcrições longas se identificadas
+    const stopWords = ["transcrição", "transcription", "gravação da reunião", "conversa na íntegra"];
     let cutoffIndex = text.length;
+    const lowerText = text.toLowerCase();
 
     for (const word of stopWords) {
         const idx = lowerText.indexOf(word);
-        // Se achou a palavra e ela não está logo no início (dando margem para título)
         if (idx !== -1 && idx < cutoffIndex && idx > 50) {
             cutoffIndex = idx;
         }
     }
 
-    // Pega o texto até o corte
     let cleanText = text.substring(0, cutoffIndex);
 
-    // SEGURANÇA ADICIONAL GET: 
-    // Mesmo sem transcrição, se o resumo for gigante, corta em 1500 chars para não quebrar a URL.
+    // Corte de segurança para URL GET (1500 chars)
     if (cleanText.length > 1500) {
-        cleanText = cleanText.substring(0, 1500) + "... [Texto truncado para caber na URL]";
+        // Pega os primeiros 1000 e os últimos 500 (onde costumam estar as conclusões)
+        cleanText = cleanText.substring(0, 1000) + "\n...[MEIO OMITIDO]...\n" + cleanText.substring(cleanText.length - 500);
     }
 
     return cleanText;
 }
 
-// --- BUSCA ABAS ---
+// --- BUSCAR TODAS AS ABAS ---
 async function getAllTabsSorted(docId) {
     try {
         const auth = getGoogleAuth();
@@ -184,17 +172,18 @@ async function getAllTabsSorted(docId) {
             }
         }
 
+        // Ordena: Antiga -> Recente
         tabsData.sort((a, b) => a.timestamp - b.timestamp);
         return tabsData;
 
     } catch (error) {
-        if (error.code === 403) throw new Error(`Permissão negada (GCP).`);
+        if (error.code === 403) throw new Error(`Permissão negada. Compartilhe com: ${process.env.GOOGLE_CLIENT_EMAIL}`);
         if (error.code === 404) throw new Error("Doc não encontrado.");
         throw error;
     }
 }
 
-// --- CRUD ---
+// --- ROTAS CRUD ---
 app.get('/api/empresas', async (req, res) => {
     const { data, error } = await supabase.from('empresas').select('*').order('nome', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
@@ -210,7 +199,7 @@ app.post('/api/empresas', async (req, res) => {
 });
 
 // ======================================================
-// LÓGICA INTELLIGENCE (SAFE GET + FILTER)
+// LÓGICA DE INTELIGÊNCIA (SAFE GET + DIRECTOR MODE)
 // ======================================================
 
 app.post('/api/resumir-empresa', async (req, res) => {
@@ -218,29 +207,32 @@ app.post('/api/resumir-empresa', async (req, res) => {
     const authHeader = getHeadOfficeToken();
     let debugLogs = [];
 
+    // --- CORREÇÃO: DECLARAÇÃO DE VARIÁVEIS NO ESCOPO SUPERIOR ---
+    let docId = null;
+    let docUrl = null;
+
     if (!authHeader) return res.status(500).json({ error: "Token HeadOffice inválido." });
 
-    let step = "Início";
-    let docId = null;
-
     try {
-        // 1. LINK
-        step = "Buscando Link no CSV";
+        // 1. LINK NO CSV
         try {
             const csvResponse = await axios.get(SHEET_CSV_URL);
             const lines = csvResponse.data.split('\n');
             for (const line of lines) {
                 if (line.toLowerCase().includes(nome.toLowerCase())) {
                     const match = line.match(/\/d\/([a-zA-Z0-9_-]+)/);
-                    if (match) { docId = match[1]; break; }
+                    if (match) { 
+                        docId = match[1];
+                        docUrl = `https://docs.google.com/document/d/${docId}`; // Atribuição correta
+                        break; 
+                    }
                 }
             }
         } catch (e) { console.warn("CSV falhou."); }
 
-        if (!docId) return res.json({ success: false, error: `Link não encontrado.` });
+        if (!docId) return res.json({ success: false, error: `Link não encontrado para ${nome}.` });
 
-        // 2. ABAS
-        step = `Lendo Abas (GCP)`;
+        // 2. LER ABAS (GCP)
         let allTabs = [];
         try {
             allTabs = await getAllTabsSorted(docId);
@@ -249,37 +241,33 @@ app.post('/api/resumir-empresa', async (req, res) => {
             return res.json({ success: false, error: apiError.message });
         }
 
-        // 3. ANÁLISE CRONOLÓGICA (SAFE)
-        step = "Análise Cronológica";
-        let currentMemory = "Início.";
-        
+        // 3. ANÁLISE CRONOLÓGICA (LOOP)
+        let currentMemory = "Nenhum histórico.";
         console.log(`[IA] Processando ${allTabs.length} abas para ${nome}.`);
 
         for (let i = 0; i < allTabs.length; i++) {
             const tab = allTabs[i];
             const isLast = i === allTabs.length - 1;
             
-            // --- AQUI ESTÁ A CORREÇÃO PRINCIPAL ---
-            // Remove a transcrição e garante tamanho seguro para GET
+            // Filtro para caber na URL
             const cleanContent = filterContentForAI(tab.content);
             
-            console.log(`[IA] Aba ${i+1}: ${tab.title}. Tamanho Original: ${tab.content.length} -> Enviado: ${cleanContent.length}`);
+            console.log(`[IA] Aba ${i+1}: ${tab.title}`);
 
             let prompt = "";
             let contextForUrl = "";
 
             if (!isLast) {
-                // ABAS PASSADAS
+                // --- MODO: ACUMULAR MEMÓRIA ---
                 prompt = `ATUE COMO CS MANAGER.
                 REUNIÃO PASSADA: ${tab.title}.
-                INSTRUÇÃO: Atualize a memória com fatos cruciais (decisões/humor). Seja conciso.`;
+                INSTRUÇÃO: Atualize a memória com fatos cruciais (decisões/humor). Seja breve.`;
                 
-                // Monta o contexto seguro para URL
-                // Memória (500) + Texto (1500) = ~2000 chars (Limite seguro de URL é ~2048 a 4096 dependendo do server)
-                contextForUrl = `MEMÓRIA: ${currentMemory.slice(0, 500)}\n\nRESUMO DA REUNIÃO:\n${cleanContent}`;
+                // Memória (500) + Texto (1500) = ~2000 chars (Safe for GET)
+                contextForUrl = `MEMÓRIA: ${currentMemory.slice(0, 500)}\n\nRESUMO DESTA REUNIÃO:\n${cleanContent}`;
 
             } else {
-                // ABA FINAL (DIRETOR DE CS)
+                // --- MODO: DIRETOR DE CS (ÚLTIMA ABA) ---
                 prompt = `ATUE COMO DIRETOR DE CS. ESTA É A ÚLTIMA REUNIÃO (${tab.title}).
                 
                 --- MISSÃO FINAL ---
@@ -304,7 +292,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
                             aiName: BOT_NAME,
                             aiId: BOT_ID,
                             question: prompt,
-                            context: contextForUrl // O contexto agora é seguro e sem transcrição
+                            context: contextForUrl 
                         },
                         headers: { 'Authorization': authHeader },
                         timeout: 30000
@@ -317,10 +305,10 @@ app.post('/api/resumir-empresa', async (req, res) => {
                     }
                 } catch (e) { 
                     console.error(`Erro IA Aba ${i}: ${e.message}`);
-                    // Se der 414 mesmo assim, tenta cortar mais
+                    // Fallback extremo se der 414
                     if (e.response && e.response.status === 414) {
                         try {
-                            const superSafeContext = contextForUrl.slice(0, 1000); // Corte drástico
+                            const superSafeContext = contextForUrl.slice(0, 800); // Corta mais
                             const r2 = await axios.get(`${BASE_URL}/openai/question`, {
                                 params: { aiName: BOT_NAME, aiId: BOT_ID, question: prompt, context: superSafeContext },
                                 headers: { 'Authorization': authHeader }
@@ -417,7 +405,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
         `;
 
         const updatePayload = {
-            doc_link: docUrl,
+            doc_link: docUrl, // Agora docUrl está garantido no escopo
             resumo: htmlResumo,
             pontos_importantes: "Ver card",
             status_cliente: score >= 7 ? "Satisfeito" : (score <= 4 ? "Crítico" : "Neutro"),
@@ -429,11 +417,11 @@ app.post('/api/resumir-empresa', async (req, res) => {
         res.json({ success: true, data: updatePayload });
 
     } catch (error) {
-        res.status(500).json({ error: "Falha processamento", details: error.message });
+        console.error(`[ERRO FATAL]:`, error.message);
+        res.status(500).json({ error: "Falha de processamento", details: error.message });
     }
 });
 
-// --- ROTA TESTE ---
 app.get('/api/debug-bot', async (req, res) => {
     try {
         const rawToken = getHeadOfficeToken();
