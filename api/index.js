@@ -49,16 +49,15 @@ function splitText(text, chunkSize) {
     return chunks;
 }
 
-// --- FUNÇÃO AUXILIAR: EXTRAIR JSON (CIRÚRGICO) ---
+// --- FUNÇÃO AUXILIAR: EXTRAIR JSON ---
 function extractJSON(text) {
     if (!text) return null;
-    // Tenta encontrar o primeiro '{' e o último '}'
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
     if (start !== -1 && end !== -1 && end > start) {
         return text.substring(start, end + 1);
     }
-    return text; // Retorna original se não achar estrutura
+    return text;
 }
 
 // --- ROTA DE RESUMO ---
@@ -73,6 +72,9 @@ app.post('/api/resumir-empresa', async (req, res) => {
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
     
     const authHeader = rawToken;
+
+    // DEBUG: Mostra início do token nos logs para garantir que está lendo
+    console.log(`[DEBUG] Token sendo usado (início): ${rawToken.substring(0, 5)}...`);
 
     if (rawToken.length < 10) return res.status(500).json({ error: "API Key/Token inválido." });
 
@@ -118,49 +120,60 @@ app.post('/api/resumir-empresa', async (req, res) => {
             const textResponse = await axios.get(txtUrl);
             fullText = typeof textResponse.data === 'string' ? textResponse.data : JSON.stringify(textResponse.data);
             
-            if (!fullText || fullText.trim().length === 0) {
-                 return res.json({ success: false, error: "O documento existe, mas está vazio (0 caracteres)." });
-            }
+            // DEBUG: Mostra o começo do texto baixado para garantir que não é HTML de login
+            console.log(`[DEBUG] Texto baixado (primeiros 100 chars): ${fullText.substring(0, 100)}`);
 
             if (fullText.includes("<!DOCTYPE html>") || fullText.includes("Google Accounts")) {
-                return res.json({ success: false, error: "Doc privado. Libere para 'Qualquer pessoa com o link'." });
+                return res.json({ success: false, error: "O Google retornou página de Login. O Doc precisa ser Público." });
+            }
+            if (fullText.length < 50) {
+                return res.json({ success: false, error: "O documento baixado está vazio ou muito curto." });
             }
         } catch (downloadError) {
-            return res.json({ success: false, error: "Falha ao baixar texto do Doc." });
+            return res.json({ success: false, error: "Falha ao baixar texto do Doc (404/403)." });
         }
 
-        // 3. ESTRATÉGIA CHAIN
+        // 3. ESTRATÉGIA CHAIN (Reduzida para garantir resposta)
         step = "Análise Contínua";
         
-        // Pega últimos 15k chars
-        const relevantText = fullText.slice(-15000); 
-        const chunks = splitText(relevantText, 2000); // Aumentei um pouco o chunk para reduzir requisições
-        console.log(`[CHAIN] ${chunks.length} partes.`);
+        // Pega os últimos 10.000 chars (reduzi para ser mais seguro)
+        const relevantText = fullText.slice(-10000); 
+        // Chunk de 1.800 chars
+        const chunks = splitText(relevantText, 1800);
+        console.log(`[CHAIN] Analisando ${chunks.length} partes...`);
 
-        let currentMemory = ""; // Começa vazio para detectarmos se a IA falhou
+        let currentMemory = "";
 
         for (let i = 0; i < chunks.length; i++) {
             const chunk = chunks[i];
             const isLast = i === chunks.length - 1;
             
-            const safeMemory = currentMemory.length > 600 ? currentMemory.substring(0, 600) + "..." : currentMemory;
+            const safeMemory = currentMemory.length > 500 ? currentMemory.substring(0, 500) + "..." : currentMemory;
 
+            // Prompt simplificado para evitar confusão da IA
             const prompt = isLast 
-                ? `PARTE FINAL. Gere o status definitivo baseado em tudo. JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico/Neutro", "status_projeto": "Em Dia/Atrasado"}`
-                : `Resuma o que aconteceu neste trecho e atualize o contexto anterior.`;
+                ? `PARTE FINAL. Gere JSON estrito: {"resumo": "RESUMO AQUI", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico/Neutro", "status_projeto": "Em Dia/Atrasado"}`
+                : `Resuma brevemente o que aconteceu aqui.`;
+
+            // DEBUG: Log antes de enviar
+            console.log(`[DEBUG] Enviando Parte ${i+1}/${chunks.length}...`);
 
             const response = await axios.get(`${BASE_URL}/openai/question`, {
                 params: {
-                    aiName: 'Roger',
-                    context: `CONTEXTO ANTERIOR: ${safeMemory || "Início"}\n\nNOVO TEXTO:\n${chunk}`,
+                    aiName: 'Roger', // VERIFIQUE SE O NOME DO SEU BOT É EXATAMENTE "Roger"
+                    context: `RESUMO ANTERIOR: ${safeMemory || "Nenhum"}\n\nTEXTO ATUAL:\n${chunk}`,
                     question: prompt
                 },
                 headers: { 'Authorization': authHeader }
             });
             
-            // Se a IA responder vazio, mantém a memória antiga. Se responder algo, atualiza.
-            if (response.data.answer) {
-                currentMemory = response.data.answer;
+            const respostaIA = response.data.answer;
+            
+            // DEBUG: Log da resposta da IA
+            console.log(`[DEBUG] Resposta IA (Parte ${i+1}):`, respostaIA ? respostaIA.substring(0, 50) + "..." : "VAZIA/NULL");
+
+            if (respostaIA) {
+                currentMemory = respostaIA;
             }
         }
 
@@ -168,22 +181,19 @@ app.post('/api/resumir-empresa', async (req, res) => {
         step = "Processando JSON";
         let result = {};
         
-        // Se currentMemory estiver vazia, significa que a IA nunca respondeu nada útil
         if (!currentMemory) {
-             return res.json({ success: false, error: "A IA não retornou nenhuma resposta válida (Resposta vazia)." });
+             // Se chegou aqui vazio, é porque a IA retornou string vazia em TODAS as tentativas
+             return res.json({ success: false, error: "A IA retornou vazio. Verifique se o nome do bot ('Roger') está correto no HeadOffice." });
         }
 
-        // Tenta extrair apenas o JSON da resposta (ignora "Aqui está o JSON...")
         const jsonOnly = extractJSON(currentMemory);
 
         try {
             result = JSON.parse(jsonOnly);
         } catch (e) {
-            console.error("[PARSE ERROR RAW]", currentMemory);
-            
-            // Fallback: Retorna o texto cru no campo resumo para você ver o erro
+            console.error("[PARSE ERROR]", currentMemory);
             result = { 
-                resumo: currentMemory.substring(0, 500) + "...", // Mostra o que a IA falou
+                resumo: currentMemory.substring(0, 600), // Salva o texto cru se não for JSON
                 status_cliente: "Erro Parse", 
                 status_projeto: "Erro Parse" 
             };
@@ -202,7 +212,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
         res.json({ success: true, data: updatePayload });
 
     } catch (error) {
-        console.error(`[ERRO] ${step}:`, error.message);
+        console.error(`[ERRO CRÍTICO] ${step}:`, error.message);
         const errorDetail = error.response ? JSON.stringify(error.response.data) : error.message;
         res.status(500).json({ error: "Falha técnica", step, details: errorDetail });
     }
