@@ -31,15 +31,21 @@ app.get('/', (req, res) => {
     res.send(htmlComUrl);
 });
 
-// --- HELPER AUTH HEADOFFICE ---
+// --- HELPER AUTH HEADOFFICE (SEM BEARER) ---
 function getHeadOfficeToken() {
     let rawToken = process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
+    
+    // REMOÇÃO RIGOROSA DO BEARER
+    if (rawToken.toLowerCase().startsWith('bearer')) {
+        rawToken = rawToken.replace(/^bearer\s+/i, "").trim();
+    }
+    
     return rawToken.length > 10 ? rawToken : null;
 }
 
-// --- HELPER AUTH GOOGLE ---
+// --- HELPER AUTH GOOGLE (DOCS) ---
 function getGoogleAuth() {
     const privateKey = process.env.GOOGLE_PRIVATE_KEY 
         ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') 
@@ -102,14 +108,14 @@ function extractJSON(text) {
     return text;
 }
 
-// --- CORE: OBTER CONTEÚDO DAS ABAS ---
+// --- GET ALL TABS (GCP) ---
 async function getAllTabsContent(docId) {
     try {
         const auth = getGoogleAuth();
         const client = await auth.getClient();
         const docs = google.docs({ version: 'v1', auth: client });
 
-        console.log(`[GCP] Baixando Doc ID: ${docId}`);
+        console.log(`[GCP] Baixando Doc: ${docId}`);
         const res = await docs.documents.get({ documentId: docId });
         const doc = res.data;
 
@@ -121,11 +127,9 @@ async function getAllTabsContent(docId) {
                 const title = t.tabProperties.title || "Sem título";
                 const date = parseDateFromTitle(title);
                 let content = "";
-                
                 if (t.documentTab && t.documentTab.body) {
                     content = readStructuralElements(t.documentTab.body.content);
                 }
-
                 if (content.trim().length > 0) {
                     tabsData.push({
                         title: title,
@@ -137,32 +141,31 @@ async function getAllTabsContent(docId) {
             });
         } 
         
-        // 2. Fallback para corpo principal
-        if (tabsData.length === 0) {
-            const bodyContent = readStructuralElements(doc.body.content);
-            if (bodyContent.trim().length > 0) {
-                tabsData.push({
-                    title: "Documento Principal",
-                    date: new Date(), 
-                    timestamp: new Date().getTime(),
-                    content: bodyContent
-                });
-            }
+        // 2. Processa Corpo Principal (Fallback)
+        // Mesmo se tiver abas, as vezes o conteúdo principal está aqui
+        const bodyContent = readStructuralElements(doc.body.content);
+        if (bodyContent.trim().length > 0) {
+            tabsData.push({
+                title: "Geral / Principal",
+                date: null, 
+                timestamp: 0, // Início da cronologia
+                content: bodyContent
+            });
         }
 
-        // 3. Ordenação: Antiga -> Recente
+        // 3. Ordenação: Antiga -> Recente (Timestamp 0 vem primeiro)
         tabsData.sort((a, b) => a.timestamp - b.timestamp);
 
         return tabsData;
 
     } catch (error) {
-        if (error.code === 403) throw new Error(`Permissão GCP negada. Compartilhe o doc com: ${process.env.GOOGLE_CLIENT_EMAIL}`);
-        if (error.code === 404) throw new Error("Doc não encontrado (404). ID inválido.");
+        if (error.code === 403) throw new Error(`Permissão GCP negada. Compartilhe com: ${process.env.GOOGLE_CLIENT_EMAIL}`);
+        if (error.code === 404) throw new Error(`Doc não encontrado (404). Link inválido.`);
         throw error;
     }
 }
 
-// --- ROTAS CRUD ---
+// --- CRUD ---
 app.get('/api/empresas', async (req, res) => {
     const { data, error } = await supabase.from('empresas').select('*').order('nome', { ascending: true });
     if (error) return res.status(500).json({ error: error.message });
@@ -178,12 +181,13 @@ app.post('/api/empresas', async (req, res) => {
 });
 
 // ======================================================
-// LÓGICA DE INTELIGÊNCIA (DEBUGGABLE)
+// LÓGICA DE INTELIGÊNCIA (COM DIAGNÓSTICO)
 // ======================================================
 
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     const authHeader = getHeadOfficeToken();
+    let debugLogs = []; // Logs para retorno em caso de erro
 
     if (!authHeader) return res.status(500).json({ error: "Token HeadOffice inválido." });
 
@@ -199,8 +203,6 @@ app.post('/api/resumir-empresa', async (req, res) => {
             const lines = csvResponse.data.split('\n');
             for (const line of lines) {
                 if (line.toLowerCase().includes(nome.toLowerCase())) {
-                    // REGEX MAIS ROBUSTO PARA PEGAR ID
-                    // Pega tudo entre /d/ e a próxima barra ou fim da string
                     const match = line.match(/\/d\/([a-zA-Z0-9_-]+)/);
                     if (match) { 
                         docId = match[1];
@@ -209,21 +211,21 @@ app.post('/api/resumir-empresa', async (req, res) => {
                     }
                 }
             }
-        } catch (e) { console.warn("CSV falhou."); }
+        } catch (e) { debugLogs.push("Erro CSV: " + e.message); }
 
-        if (!docId) return res.json({ success: false, error: `Link não encontrado para ${nome}.` });
+        if (!docId) return res.json({ success: false, error: `Link não encontrado na planilha.` });
 
         // 2. EXTRAIR ABAS
-        step = `Lendo Abas (ID: ${docId})`;
+        step = `Lendo Google Docs`;
         let allTabs = [];
         try {
             allTabs = await getAllTabsContent(docId);
-            if (allTabs.length === 0) return res.json({ success: false, error: "Doc acessado, mas está vazio." });
+            if (allTabs.length === 0) return res.json({ success: false, error: "Doc vazio (sem texto identificável)." });
         } catch (apiError) {
             return res.json({ success: false, error: apiError.message });
         }
 
-        // 3. TIMELINE PROCESSING
+        // 3. PROCESSAMENTO EM CADEIA
         step = "Análise Histórica";
         let currentMemory = "Início da análise. Nenhum dado prévio.";
         
@@ -232,47 +234,47 @@ app.post('/api/resumir-empresa', async (req, res) => {
         for (let i = 0; i < allTabs.length; i++) {
             const tab = allTabs[i];
             const isLast = i === allTabs.length - 1;
+            const tabContentSafe = tab.content.slice(0, 10000); // 10k chars max
             
-            // Corta texto para segurança
-            const tabContentSafe = tab.content.slice(0, 15000); 
-            
-            // --- PROMPT ---
+            // Log
+            const logMsg = `Processando Aba ${i+1}: ${tab.title} (${tabContentSafe.length} chars)`;
+            debugLogs.push(logMsg);
+            console.log(logMsg);
+
             let prompt = "";
 
             if (!isLast) {
+                // ABAS PASSADAS: Acumular Memória
                 prompt = `ATUE COMO CS MANAGER. Analisando histórico.
-                REUNIÃO PASSADA (Data: ${tab.title}).
+                REUNIÃO PASSADA: ${tab.title}.
                 
                 MEMÓRIA ATUAL: ${currentMemory}
                 
-                TEXTO DA REUNIÃO: ${tabContentSafe.slice(0, 4000)}
+                CONTEÚDO DESTA REUNIÃO: ${tabContentSafe}
                 
                 INSTRUÇÃO:
-                Atualize a memória com fatos desta reunião:
-                1. O sentimento mudou?
-                2. Checkpoints concluídos NESTA data?
-                3. Reclamações?
-                
-                Responda APENAS com o Resumo Atualizado.`;
+                Atualize a memória com fatos importantes desta reunião (humor, decisões, entregas).
+                Seja conciso. Responda APENAS com o Resumo Atualizado.`;
             } else {
+                // ABA FINAL: Relatório
                 prompt = `ATUE COMO DIRETOR DE CS. ESTA É A ÚLTIMA REUNIÃO (${tab.title}).
                 
-                CONTEXTO HISTÓRICO: 
-                ${currentMemory.slice(0, 4000)}
+                HISTÓRICO ACUMULADO: 
+                ${currentMemory}
                 
                 CONTEÚDO DA ÚLTIMA REUNIÃO:
                 ${tabContentSafe}
                 
                 --- MISSÃO FINAL ---
-                Gere o Relatório de Inteligência Oficial.
+                Gere o Relatório de Inteligência.
                 
                 REGRAS:
-                1. **Checkpoints/Metas:** Use EXCLUSIVAMENTE o texto da "ÚLTIMA REUNIÃO".
+                1. **Checkpoints/Próximos Passos:** Use SOMENTE o texto da "ÚLTIMA REUNIÃO".
                 2. **Sentimento/Perfil:** Use o HISTÓRICO + ÚLTIMA REUNIÃO.
                 
                 SAÍDA JSON ESTRITO:
                 {
-                    "resumo_executivo": "Visão geral.",
+                    "resumo_executivo": "Visão geral do status.",
                     "perfil_cliente": "Análise psicológica.",
                     "estrategia_relacionamento": "Ação recomendada.",
                     "checkpoints_feitos": ["O que foi entregue NESTA ÚLTIMA sessão?"],
@@ -283,9 +285,11 @@ app.post('/api/resumir-empresa', async (req, res) => {
                 }`;
             }
 
-            // Retry Logic
+            // Retry Logic com Timeout Maior
             let respostaIA = "";
-            for (let retry = 0; retry < 3; retry++) {
+            let apiError = "";
+            
+            for (let retry = 0; retry < 2; retry++) {
                 try {
                     const response = await axios.get(`${BASE_URL}/openai/question`, {
                         params: {
@@ -294,43 +298,43 @@ app.post('/api/resumir-empresa', async (req, res) => {
                             question: prompt
                         },
                         headers: { 'Authorization': authHeader },
-                        timeout: 30000 // 30s timeout
+                        timeout: 60000 // 60 segundos de timeout!
                     });
                     
                     const tResp = response.data.text || response.data.answer;
                     if (tResp && tResp.trim().length > 5) {
                         respostaIA = tResp;
                         break; 
+                    } else {
+                        apiError = "Resposta vazia da IA";
                     }
                 } catch (e) { 
-                    console.error(`Erro IA (Tentativa ${retry+1}):`, e.message); 
+                    apiError = e.message;
+                    console.error(`Erro IA Aba ${i} (Tentativa ${retry+1}):`, e.message); 
                 }
             }
 
             if (respostaIA) {
-                if (!isLast) {
-                    currentMemory = respostaIA; 
-                } else {
-                    currentMemory = respostaIA; // JSON Final
-                }
+                currentMemory = respostaIA; 
+                debugLogs.push(`> Sucesso Aba ${i+1}`);
             } else {
-                console.warn(`[AVISO] IA falhou na aba ${i}. Ignorando.`);
+                debugLogs.push(`> FALHA Aba ${i+1}: ${apiError}`);
             }
         }
 
-        // 4. RENDERIZAÇÃO
+        // 4. VERIFICAÇÃO FINAL
         const jsonOnly = extractJSON(currentMemory);
         let data = {};
 
         try {
             data = JSON.parse(jsonOnly);
         } catch (e) {
-            // Se falhar o parse, significa que a IA não retornou JSON válido na última etapa
-            // Pode ser que ela tenha falhado em todas as etapas
-            if (currentMemory === "Início da análise. Nenhum dado prévio.") {
-                 return res.json({ success: false, error: "A IA não processou nenhuma aba com sucesso." });
-            }
-            data = { resumo_executivo: "Erro ao gerar JSON Final. Texto bruto: " + currentMemory.substring(0, 300) };
+            // Se falhou, retorna os logs para você entender o que aconteceu
+            return res.json({ 
+                success: false, 
+                error: "Falha na IA. Logs de Execução:",
+                details: debugLogs 
+            });
         }
 
         const score = parseInt(data.sentimento_score) || 5;
@@ -356,7 +360,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
                     <div class="bg-[#0f172a] p-2.5 rounded border border-white/5 hover:border-indigo-500/30 transition-colors">
                         <div class="flex items-center gap-2 mb-1">
                             <i data-lucide="brain" class="w-3 h-3 text-purple-400"></i>
-                            <span class="text-[10px] font-bold text-purple-200 uppercase tracking-wide">Perfil</span>
+                            <span class="text-[10px] font-bold text-purple-200 uppercase tracking-wide">Perfil (Histórico)</span>
                         </div>
                         <p class="text-[10px] text-slate-400 leading-snug">${data.perfil_cliente || "-"}</p>
                     </div>
