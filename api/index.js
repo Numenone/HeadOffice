@@ -29,9 +29,9 @@ const SHEET_ID = '1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM';
 const HEADOFFICE_API_URL = 'https://api.headoffice.ai/v1';
 
 // Rota de teste para ver se a API está viva
-app.get('/', (req, res) => {
-    res.send('IAgente Backend Online 🚀');
-});
+//app.get('/', (req, res) => {
+//    res.send('IAgente Backend Online 🚀');
+//});
 
 app.get('/api/dashboard-data', async (req, res) => {
     try {
