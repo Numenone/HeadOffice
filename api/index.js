@@ -15,6 +15,7 @@ const supabase = createClient(
     process.env.SUPABASE_KEY || ''
 );
 
+// URL Base (Note a escrita correta 'openai')
 const BASE_URL = 'https://api.headoffice.ai/v1';
 const SHEET_FULL_URL = 'https://docs.google.com/spreadsheets/d/1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM/edit?gid=0#gid=0';
 
@@ -41,95 +42,89 @@ app.post('/api/empresas', async (req, res) => {
     res.json({ success: true, data });
 });
 
-// --- ROTA 4: RESUMIR EMPRESA (FIXED: GET METHOD) ---
+// --- ROTA 4: RESUMIR EMPRESA (Estratégia 2-Passos GET) ---
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     const HEADOFFICE_API_KEY = process.env.HEADOFFICE_API_KEY;
-    
-    try {
-        const prompt = `
-            Contexto: Planilha ${SHEET_FULL_URL}.
-            Tarefa:
-            1. Ache a empresa "${nome}".
-            2. Pegue o Link do Doc dessa empresa.
-            3. Leia o Doc e resuma a ÚLTIMA sessão.
-            
-            Retorne JSON estrito:
-            {
-                "doc_link_encontrado": "url encontrada",
-                "resumo": "resumo curto",
-                "pontos_importantes": "top 3 pontos",
-                "status_cliente": "Satisfeito/Crítico",
-                "status_projeto": "Em Dia/Atrasado"
-            }
-        `;
+    let step = "Início";
 
-        // MUDANÇA CRÍTICA: AXIOS.GET ao invés de POST
-        // Passamos os dados via query params
-        const response = await axios.get(`${BASE_URL}/openai/comunication`, {
+    try {
+        // --- PASSO 1: Descobrir o Link (Request Leve) ---
+        step = "Buscando Link na Planilha";
+        
+        // Usamos /openai/question pois é mais leve que communication
+        const linkResponse = await axios.get(`${BASE_URL}/openai/question`, {
             params: {
-                context: `Analista da empresa: ${nome}`,
-                message: prompt // Enviando o prompt na URL
+                context: `Planilha: ${SHEET_FULL_URL}`,
+                question: `Qual é a URL do documento (Link Docs) da empresa "${nome}"? Retorne APENAS a URL, sem texto.`
             },
             headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` }
         });
 
-        // Tratamento da resposta
+        const answerLink = linkResponse.data.answer || "";
+        const urlMatch = answerLink.match(/(https?:\/\/[^\s]+)/);
+        const docUrl = urlMatch ? urlMatch[0] : null;
+
+        if (!docUrl) {
+            return res.json({ success: false, error: `Link da empresa "${nome}" não encontrado na planilha.` });
+        }
+
+        // --- PASSO 2: Resumir o Documento (Request Médio) ---
+        step = "Lendo Documento Encontrado";
+        
+        // Agora o contexto é o link específico, não a planilha toda. Isso economiza tokens e evita erro 500.
+        const summaryResponse = await axios.get(`${BASE_URL}/openai/question`, {
+            params: {
+                context: `Documento: ${docUrl}`,
+                question: `Leia a ÚLTIMA sessão (data mais recente). Retorne JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico", "status_projeto": "Em Dia/Atrasado"}`
+            },
+            headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` }
+        });
+
+        // --- TRATAMENTO ---
         let result = {};
-        // A API pode retornar 'answer' ou 'message', verificamos ambos
-        const answerRaw = response.data.answer || response.data.message || "";
+        const answerRaw = summaryResponse.data.answer || "";
         
         try {
             const cleanJson = answerRaw.replace(/```json/g, '').replace(/```/g, '').trim();
             result = JSON.parse(cleanJson);
         } catch (e) {
             result = { 
-                resumo: answerRaw.substring(0, 500) || "Sem resposta válida da IA.", 
+                resumo: answerRaw.substring(0, 400), 
                 status_cliente: "Erro Leitura",
                 status_projeto: "Erro Leitura" 
             };
         }
 
-        // Atualizar Banco
+        // --- SALVAR NO BANCO ---
         const updatePayload = {
+            doc_link: docUrl,
             resumo: result.resumo,
             pontos_importantes: result.pontos_importantes || "",
             status_cliente: result.status_cliente || "Neutro",
             status_projeto: result.status_projeto || "Em Análise",
             last_updated: new Date()
         };
-        
-        if (result.doc_link_encontrado && result.doc_link_encontrado.startsWith('http')) {
-            updatePayload.doc_link = result.doc_link_encontrado;
-        }
 
-        const { error } = await supabase
-            .from('empresas')
-            .update(updatePayload)
-            .eq('id', id);
-
-        if (error) throw error;
+        await supabase.from('empresas').update(updatePayload).eq('id', id);
 
         res.json({ success: true, data: updatePayload });
 
     } catch (error) {
-        console.error("Erro API HeadOffice:", error.message);
+        console.error(`Erro no passo [${step}]:`, error.message);
         
-        // Detalhar o erro para o frontend
+        // Retorna erro amigável
         const errorMsg = error.response 
-            ? `Status ${error.response.status}: ${JSON.stringify(error.response.data)}` 
+            ? `Erro API HeadOffice (${error.response.status}): ${JSON.stringify(error.response.data)}` 
             : error.message;
 
-        res.status(500).json({ 
-            error: "Falha na comunicação com IA", 
-            details: errorMsg 
-        });
+        res.status(500).json({ error: "Falha no processamento", step, details: errorMsg });
     }
 });
 
 module.exports = app;
 
-// --- FRONTEND (Dashboard) ---
+// --- FRONTEND IGUAL AO ANTERIOR ---
 const DASHBOARD_HTML = `
 <!DOCTYPE html>
 <html lang="pt-BR">
