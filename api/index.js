@@ -17,9 +17,8 @@ const supabase = createClient(
 );
 
 const BASE_URL = 'https://api.headoffice.ai/v1';
-const SHEET_ID = '1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM';
-const SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=0`;
-const SHEET_FULL_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`;
+// ID da Planilha Mestra
+const SPREADSHEET_ID = '1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM';
 
 // ID DO BOT ROGER
 const BOT_ID = '69372353b11d9df606b68bf8';
@@ -32,82 +31,121 @@ app.get('/', (req, res) => {
     res.send(htmlComUrl);
 });
 
-// --- HELPER AUTH HEADOFFICE ---
-function getHeadOfficeToken() {
-    let rawToken = process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
-    rawToken = rawToken.trim();
-    if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
-    return rawToken.length > 10 ? rawToken : null;
+// --- HELPER AUTH GOOGLE (GCP) ---
+function getGoogleAuth() {
+    const privateKey = process.env.GOOGLE_PRIVATE_KEY 
+        ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') 
+        : undefined;
+
+    if (!privateKey || !process.env.GOOGLE_CLIENT_EMAIL) {
+        throw new Error("Credenciais GCP (GOOGLE_CLIENT_EMAIL ou GOOGLE_PRIVATE_KEY) faltando.");
+    }
+
+    return new google.auth.GoogleAuth({
+        credentials: {
+            client_email: process.env.GOOGLE_CLIENT_EMAIL,
+            private_key: privateKey,
+        },
+        // Escopos para Ler Planilhas e Documentos
+        scopes: [
+            'https://www.googleapis.com/auth/documents.readonly',
+            'https://www.googleapis.com/auth/spreadsheets.readonly'
+        ],
+    });
 }
 
-// --- HELPER: EXTRATOR UNIVERSAL DO GOOGLE DOCS ---
-// Essa função recursiva lê texto dentro de Parágrafos, Tabelas, Listas, Rodapés, etc.
+// --- HELPER: BUSCAR URL NA PLANILHA (VIA API) ---
+async function findDocUrlInSheet(companyName) {
+    const auth = getGoogleAuth();
+    const client = await auth.getClient();
+    const sheets = google.sheets({ version: 'v4', auth: client });
+
+    // Lê todas as linhas da Aba 1 (assumindo que é a primeira)
+    const res = await sheets.spreadsheets.values.get({
+        spreadsheetId: SPREADSHEET_ID,
+        range: 'A:Z', // Lê colunas de A a Z
+    });
+
+    const rows = res.data.values;
+    if (!rows || rows.length === 0) return null;
+
+    // Cabeçalho está na linha 0. Vamos descobrir qual coluna é "Empresa" e qual é "Link Docs"
+    const headers = rows[0].map(h => h.toLowerCase());
+    
+    // Tenta achar índices das colunas (flexível)
+    const idxNome = headers.findIndex(h => h.includes("empresa") || h.includes("nome") || h.includes("cliente"));
+    // Procura por "link", "url", "docs"
+    const idxLink = headers.findIndex(h => h.includes("link docs") || h.includes("url") || h.includes("documento"));
+
+    if (idxNome === -1 || idxLink === -1) {
+        throw new Error(`Não achei as colunas 'Empresa' e 'Link Docs' na planilha. Colunas encontradas: ${headers.join(', ')}`);
+    }
+
+    // Procura a empresa
+    for (let i = 1; i < rows.length; i++) {
+        const row = rows[i];
+        const rowCompany = row[idxNome];
+        
+        if (rowCompany && rowCompany.toLowerCase().trim() === companyName.toLowerCase().trim()) {
+            return row[idxLink]; // Retorna a URL encontrada
+        }
+    }
+    return null;
+}
+
+// --- HELPER: EXTRATOR UNIVERSAL DO DOCS (LÊ TUDO) ---
 function readStructuralElements(elements) {
     let text = '';
     if (!elements) return text;
 
     elements.forEach(element => {
-        // 1. Texto Normal (Paragraph)
         if (element.paragraph) {
             element.paragraph.elements.forEach(el => {
                 if (el.textRun && el.textRun.content) {
                     text += el.textRun.content;
                 }
             });
-        }
-        // 2. Tabelas (Table) - Comum em templates
-        else if (element.table) {
+        } else if (element.table) {
             element.table.tableRows.forEach(row => {
                 row.tableCells.forEach(cell => {
-                    // Recursividade: Uma célula contém "content" que são structural elements
                     text += readStructuralElements(cell.content) + " | "; 
                 });
-                text += "\n"; // Quebra de linha por linha da tabela
+                text += "\n";
             });
-        }
-        // 3. Tabela de Conteúdo (TableOfContents)
-        else if (element.tableOfContents) {
+        } else if (element.tableOfContents) {
             text += readStructuralElements(element.tableOfContents.content);
         }
     });
     return text;
 }
 
-// --- FUNÇÃO PRINCIPAL GOOGLE DOCS ---
+// --- HELPER: LER DOCUMENTO (VIA API) ---
 async function getGoogleDocContent(docId) {
     try {
-        const privateKey = process.env.GOOGLE_PRIVATE_KEY 
-            ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') 
-            : undefined;
-
-        if (!privateKey || !process.env.GOOGLE_CLIENT_EMAIL) {
-            throw new Error("Credenciais GCP ausentes (GOOGLE_CLIENT_EMAIL/PRIVATE_KEY).");
-        }
-
-        const auth = new google.auth.GoogleAuth({
-            credentials: {
-                client_email: process.env.GOOGLE_CLIENT_EMAIL,
-                private_key: privateKey,
-            },
-            scopes: ['https://www.googleapis.com/auth/documents.readonly'],
-        });
-
+        const auth = getGoogleAuth();
         const client = await auth.getClient();
         const docs = google.docs({ version: 'v1', auth: client });
 
-        console.log(`[GCP] Baixando Doc ID: ${docId}`);
+        console.log(`[GCP] Acessando Doc ID: ${docId}`);
         const res = await docs.documents.get({ documentId: docId });
         
-        // Usa o extrator universal
+        // Extrai TODO o conteúdo
         const fullText = readStructuralElements(res.data.body.content);
-        
-        console.log(`[GCP] Texto extraído com sucesso: ${fullText.length} caracteres.`);
         return fullText;
 
     } catch (error) {
-        if (error.code === 403) throw new Error(`Permissão negada. Compartilhe o doc com: ${process.env.GOOGLE_CLIENT_EMAIL}`);
+        if (error.code === 403) throw new Error(`Permissão negada no DOC. Compartilhe este doc específico com: ${process.env.GOOGLE_CLIENT_EMAIL}`);
+        if (error.code === 404) throw new Error("Documento não encontrado (404). Link quebrado.");
         throw error;
     }
+}
+
+// --- HELPER AUTH HEADOFFICE ---
+function getHeadOfficeToken() {
+    let rawToken = process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
+    rawToken = rawToken.trim();
+    if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
+    return rawToken.length > 10 ? rawToken : null;
 }
 
 // --- HELPERS ÚTEIS ---
@@ -145,7 +183,7 @@ app.post('/api/empresas', async (req, res) => {
 });
 
 // ======================================================
-// LÓGICA DE INTELIGÊNCIA ARTIFICIAL (CS INTELLIGENCE V4)
+// LÓGICA DE INTELIGÊNCIA ARTIFICIAL (CS INTELLIGENCE V5 - FINAL)
 // ======================================================
 
 app.post('/api/resumir-empresa', async (req, res) => {
@@ -159,44 +197,46 @@ app.post('/api/resumir-empresa', async (req, res) => {
     let docId = null;
 
     try {
-        // 1. Encontrar Link
-        step = "Buscando Link no CSV";
+        // 1. BUSCAR LINK NA PLANILHA (USANDO API GOOGLE SHEETS)
+        step = "Consultando Planilha (Google Sheets API)";
         try {
-            const csvResponse = await axios.get(SHEET_CSV_URL);
-            const lines = csvResponse.data.split('\n');
-            for (const line of lines) {
-                if (line.toLowerCase().includes(nome.toLowerCase())) {
-                    const match = line.match(/(https:\/\/docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+))/);
-                    if (match) { 
-                        docUrl = match[0]; 
-                        docId = match[2];
-                        break; 
-                    }
-                }
+            docUrl = await findDocUrlInSheet(nome);
+            
+            if (docUrl) {
+                // Extrai ID do Doc
+                const match = docUrl.match(/(https:\/\/docs\.google\.com\/document\/d\/([a-zA-Z0-9_-]+))/);
+                if (match) docId = match[2];
             }
-        } catch (e) { console.warn("CSV falhou."); }
+        } catch (sheetError) {
+            console.error("Erro Planilha:", sheetError.message);
+            return res.json({ success: false, error: `Erro ao ler planilha: ${sheetError.message}. Verifique se compartilhou a planilha com o robô.` });
+        }
 
-        if (!docUrl) return res.json({ success: false, error: `Link não encontrado na planilha.` });
+        if (!docUrl || !docId) {
+            return res.json({ success: false, error: `Empresa "${nome}" não encontrada na planilha ou sem link válido.` });
+        }
 
-        // 2. Extração Robusta (Service Account)
-        step = `Lendo Google Docs (GCP)`;
+        // 2. LER DOCUMENTO (USANDO API GOOGLE DOCS)
+        step = `Lendo Documento Completo`;
         let fullText = "";
         
         try {
             fullText = await getGoogleDocContent(docId);
             
-            if (!fullText || fullText.trim().length < 10) {
-                return res.json({ success: false, error: "Doc acessado, mas parece vazio. Verifique se o texto está dentro de desenhos ou imagens (não suportado)." });
+            if (!fullText || fullText.trim().length < 20) {
+                return res.json({ success: false, error: "O documento foi acessado, mas está vazio." });
             }
         } catch (apiError) {
-            console.error("Erro GCP:", apiError.message);
+            console.error("Erro Docs:", apiError.message);
             return res.json({ success: false, error: apiError.message });
         }
 
-        // 3. Chain of Density (AI)
+        // 3. PROCESSAMENTO DE INTELIGÊNCIA (CHAIN OF DENSITY)
         step = "Processamento Neural CS";
-        const relevantText = fullText.slice(-25000); 
-        const chunks = splitText(relevantText, 3500); 
+        
+        // Pega um contexto maior (30k caracteres)
+        const relevantText = fullText.slice(-30000); 
+        const chunks = splitText(relevantText, 4000); 
         console.log(`[CHAIN] Analisando ${chunks.length} blocos.`);
 
         let currentMemory = "";
@@ -204,26 +244,35 @@ app.post('/api/resumir-empresa', async (req, res) => {
         for (let i = 0; i < chunks.length; i++) {
             const chunk = chunks[i];
             const isLast = i === chunks.length - 1;
-            const safeMemory = currentMemory.length > 2000 ? currentMemory.substring(0, 2000) + "..." : currentMemory;
+            const safeMemory = currentMemory.length > 2500 ? currentMemory.substring(0, 2500) + "..." : currentMemory;
 
+            // --- PROMPT DE ALTA PRECISÃO ---
             const prompt = isLast 
-                ? `VOCÊ É UM DIRETOR DE CUSTOMER SUCCESS.
-                   Analise os dados abaixo (extraídos de tabelas e textos do doc).
+                ? `VOCÊ É O DIRETOR DE SUCESSO DO CLIENTE.
+                   Analise os registros brutos abaixo (extraídos diretamente do Google Docs).
                    
-                   🚨 DADOS REAIS APENAS. Se o doc for um template vazio, diga "Sem dados preenchidos".
+                   OBJETIVO: Criar um relatório de inteligência estratégica.
+                   
+                   INSTRUÇÕES:
+                   1. Baseie-se APENAS no texto. Se não houver dados, diga "Não informado".
+                   2. **Resumo:** Sintetize o cenário atual do projeto.
+                   3. **Perfil:** Identifique padrões de comportamento do cliente nas falas.
+                   4. **Estratégia:** Dê uma ordem clara para o CSM da conta.
+                   5. **Checkpoints:** Liste entregas confirmadas no texto.
+                   6. **Sentimento:** Dê uma nota de 0 a 10 baseada no tom das conversas.
 
-                   Gere JSON estrito:
+                   SAÍDA (JSON ESTRITO):
                    {
-                      "resumo_executivo": "Situação atual baseada nos fatos do texto.",
-                      "perfil_cliente": "Análise do comportamento e tom do cliente.",
-                      "estrategia_relacionamento": "Ação recomendada para o CS.",
-                      "checkpoints_feitos": ["Lista do que já foi entregue"],
-                      "proximos_passos": ["Lista do que falta fazer"],
-                      "riscos_bloqueios": "Impedimentos ou insatisfações citadas.",
-                      "sentimento_score": "0 a 10",
-                      "status_projeto": "Em Dia/Atrasado"
+                      "resumo_executivo": "Texto corrido do cenário atual...",
+                      "perfil_cliente": "Análise do perfil...",
+                      "estrategia_relacionamento": "Ação recomendada...",
+                      "checkpoints_feitos": ["Item A", "Item B"],
+                      "proximos_passos": ["Item C", "Item D"],
+                      "riscos_bloqueios": "Descrição de riscos...",
+                      "sentimento_score": "8",
+                      "status_projeto": "Em Dia"
                    }`
-                : `Leia este trecho (pode conter tabelas desformatadas). Identifique datas, entregas e reclamações. Ignore linhas vazias.`;
+                : `Analise este bloco de texto. Identifique progresso, datas e reclamações. Ignore formalidades.`;
 
             let respostaIA = "";
             for (let retry = 0; retry < 2; retry++) {
@@ -232,7 +281,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
                         params: {
                             aiName: BOT_NAME,
                             aiId: BOT_ID,
-                            context: `RESUMO ANTERIOR: ${safeMemory || "Início"}\n\nCONTEÚDO DO DOC:\n${chunk}`,
+                            context: `RESUMO ATÉ AGORA: ${safeMemory || "Início"}\n\nTEXTO DA SESSÃO ATUAL:\n${chunk}`,
                             question: prompt
                         },
                         headers: { 'Authorization': authHeader }
@@ -249,9 +298,9 @@ app.post('/api/resumir-empresa', async (req, res) => {
             if (respostaIA) currentMemory = respostaIA;
         }
 
-        // 4. Renderização
-        step = "Gerando Visualização";
-        if (!currentMemory) return res.json({ success: false, error: `IA muda.` });
+        // 4. RENDERIZAÇÃO
+        step = "Gerando Interface";
+        if (!currentMemory) return res.json({ success: false, error: `IA não respondeu.` });
 
         const jsonOnly = extractJSON(currentMemory);
         let data = {};
@@ -259,7 +308,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
         try {
             data = JSON.parse(jsonOnly);
         } catch (e) {
-            data = { resumo_executivo: "Erro ao processar JSON da IA. Texto bruto: " + currentMemory.substring(0, 100) };
+            data = { resumo_executivo: "Erro no JSON: " + currentMemory.substring(0, 200) };
         }
 
         const score = parseInt(data.sentimento_score) || 5;
