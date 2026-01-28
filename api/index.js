@@ -20,7 +20,6 @@ const BASE_URL = 'https://api.headoffice.ai/v1';
 const SHEET_ID = '1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM';
 const SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=0`;
 
-// ID DO BOT ROGER
 const BOT_ID = '69372353b11d9df606b68bf8';
 const BOT_NAME = 'Roger';
 
@@ -37,15 +36,14 @@ function getHeadOfficeToken() {
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
     
-    // REMOÇÃO RIGOROSA DO BEARER
+    // Remove "Bearer" para evitar erro 403
     if (rawToken.toLowerCase().startsWith('bearer')) {
         rawToken = rawToken.replace(/^bearer\s+/i, "").trim();
     }
-    
     return rawToken.length > 10 ? rawToken : null;
 }
 
-// --- HELPER AUTH GOOGLE (DOCS) ---
+// --- HELPER AUTH GOOGLE ---
 function getGoogleAuth() {
     const privateKey = process.env.GOOGLE_PRIVATE_KEY 
         ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') 
@@ -108,8 +106,47 @@ function extractJSON(text) {
     return text;
 }
 
-// --- GET ALL TABS (GCP) ---
-async function getAllTabsContent(docId) {
+// --- INTELLIGENT TRIMMER (O SEGREDO PARA NÃO ESTOURAR 414) ---
+// Remove a parte da "Transcrição" e mantém apenas o resumo/pauta
+function filterContentForAI(text) {
+    if (!text) return "";
+
+    const lowerText = text.toLowerCase();
+    
+    // Palavras que indicam o início da transcrição bruta (lixo para o resumo)
+    const stopWords = [
+        "transcrição", 
+        "transcription", 
+        "audio transcription", 
+        "gravação da reunião", 
+        "conversa na íntegra",
+        "transcript:"
+    ];
+
+    let cutoffIndex = text.length;
+
+    for (const word of stopWords) {
+        const idx = lowerText.indexOf(word);
+        // Se achou a palavra e ela não está logo no início (dando margem para título)
+        if (idx !== -1 && idx < cutoffIndex && idx > 50) {
+            cutoffIndex = idx;
+        }
+    }
+
+    // Pega o texto até o corte
+    let cleanText = text.substring(0, cutoffIndex);
+
+    // SEGURANÇA ADICIONAL GET: 
+    // Mesmo sem transcrição, se o resumo for gigante, corta em 1500 chars para não quebrar a URL.
+    if (cleanText.length > 1500) {
+        cleanText = cleanText.substring(0, 1500) + "... [Texto truncado para caber na URL]";
+    }
+
+    return cleanText;
+}
+
+// --- BUSCA ABAS ---
+async function getAllTabsSorted(docId) {
     try {
         const auth = getGoogleAuth();
         const client = await auth.getClient();
@@ -121,10 +158,9 @@ async function getAllTabsContent(docId) {
 
         let tabsData = [];
 
-        // 1. Processa Abas
         if (doc.tabs && doc.tabs.length > 0) {
             doc.tabs.forEach(t => {
-                const title = t.tabProperties.title || "Sem título";
+                const title = t.tabProperties.title || "Sem Título";
                 const date = parseDateFromTitle(title);
                 let content = "";
                 if (t.documentTab && t.documentTab.body) {
@@ -141,26 +177,19 @@ async function getAllTabsContent(docId) {
             });
         } 
         
-        // 2. Processa Corpo Principal (Fallback)
-        // Mesmo se tiver abas, as vezes o conteúdo principal está aqui
-        const bodyContent = readStructuralElements(doc.body.content);
-        if (bodyContent.trim().length > 0) {
-            tabsData.push({
-                title: "Geral / Principal",
-                date: null, 
-                timestamp: 0, // Início da cronologia
-                content: bodyContent
-            });
+        if (tabsData.length === 0) {
+            const bodyContent = readStructuralElements(doc.body.content);
+            if (bodyContent.trim().length > 0) {
+                tabsData.push({ title: "Geral", date: null, timestamp: 0, content: bodyContent });
+            }
         }
 
-        // 3. Ordenação: Antiga -> Recente (Timestamp 0 vem primeiro)
         tabsData.sort((a, b) => a.timestamp - b.timestamp);
-
         return tabsData;
 
     } catch (error) {
-        if (error.code === 403) throw new Error(`Permissão GCP negada. Compartilhe com: ${process.env.GOOGLE_CLIENT_EMAIL}`);
-        if (error.code === 404) throw new Error(`Doc não encontrado (404). Link inválido.`);
+        if (error.code === 403) throw new Error(`Permissão negada (GCP).`);
+        if (error.code === 404) throw new Error("Doc não encontrado.");
         throw error;
     }
 }
@@ -181,22 +210,21 @@ app.post('/api/empresas', async (req, res) => {
 });
 
 // ======================================================
-// LÓGICA DE INTELIGÊNCIA (COM DIAGNÓSTICO)
+// LÓGICA INTELLIGENCE (SAFE GET + FILTER)
 // ======================================================
 
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     const authHeader = getHeadOfficeToken();
-    let debugLogs = []; // Logs para retorno em caso de erro
+    let debugLogs = [];
 
     if (!authHeader) return res.status(500).json({ error: "Token HeadOffice inválido." });
 
     let step = "Início";
-    let docUrl = null;
     let docId = null;
 
     try {
-        // 1. LINK NO CSV
+        // 1. LINK
         step = "Buscando Link no CSV";
         try {
             const csvResponse = await axios.get(SHEET_CSV_URL);
@@ -204,137 +232,120 @@ app.post('/api/resumir-empresa', async (req, res) => {
             for (const line of lines) {
                 if (line.toLowerCase().includes(nome.toLowerCase())) {
                     const match = line.match(/\/d\/([a-zA-Z0-9_-]+)/);
-                    if (match) { 
-                        docId = match[1];
-                        docUrl = `https://docs.google.com/document/d/${docId}`;
-                        break; 
-                    }
+                    if (match) { docId = match[1]; break; }
                 }
             }
-        } catch (e) { debugLogs.push("Erro CSV: " + e.message); }
+        } catch (e) { console.warn("CSV falhou."); }
 
-        if (!docId) return res.json({ success: false, error: `Link não encontrado na planilha.` });
+        if (!docId) return res.json({ success: false, error: `Link não encontrado.` });
 
-        // 2. EXTRAIR ABAS
-        step = `Lendo Google Docs`;
+        // 2. ABAS
+        step = `Lendo Abas (GCP)`;
         let allTabs = [];
         try {
-            allTabs = await getAllTabsContent(docId);
-            if (allTabs.length === 0) return res.json({ success: false, error: "Doc vazio (sem texto identificável)." });
+            allTabs = await getAllTabsSorted(docId);
+            if (allTabs.length === 0) return res.json({ success: false, error: "Doc vazio." });
         } catch (apiError) {
             return res.json({ success: false, error: apiError.message });
         }
 
-        // 3. PROCESSAMENTO EM CADEIA
-        step = "Análise Histórica";
-        let currentMemory = "Início da análise. Nenhum dado prévio.";
+        // 3. ANÁLISE CRONOLÓGICA (SAFE)
+        step = "Análise Cronológica";
+        let currentMemory = "Início.";
         
         console.log(`[IA] Processando ${allTabs.length} abas para ${nome}.`);
 
         for (let i = 0; i < allTabs.length; i++) {
             const tab = allTabs[i];
             const isLast = i === allTabs.length - 1;
-            const tabContentSafe = tab.content.slice(0, 10000); // 10k chars max
             
-            // Log
-            const logMsg = `Processando Aba ${i+1}: ${tab.title} (${tabContentSafe.length} chars)`;
-            debugLogs.push(logMsg);
-            console.log(logMsg);
+            // --- AQUI ESTÁ A CORREÇÃO PRINCIPAL ---
+            // Remove a transcrição e garante tamanho seguro para GET
+            const cleanContent = filterContentForAI(tab.content);
+            
+            console.log(`[IA] Aba ${i+1}: ${tab.title}. Tamanho Original: ${tab.content.length} -> Enviado: ${cleanContent.length}`);
 
             let prompt = "";
+            let contextForUrl = "";
 
             if (!isLast) {
-                // ABAS PASSADAS: Acumular Memória
-                prompt = `ATUE COMO CS MANAGER. Analisando histórico.
+                // ABAS PASSADAS
+                prompt = `ATUE COMO CS MANAGER.
                 REUNIÃO PASSADA: ${tab.title}.
+                INSTRUÇÃO: Atualize a memória com fatos cruciais (decisões/humor). Seja conciso.`;
                 
-                MEMÓRIA ATUAL: ${currentMemory}
-                
-                CONTEÚDO DESTA REUNIÃO: ${tabContentSafe}
-                
-                INSTRUÇÃO:
-                Atualize a memória com fatos importantes desta reunião (humor, decisões, entregas).
-                Seja conciso. Responda APENAS com o Resumo Atualizado.`;
+                // Monta o contexto seguro para URL
+                // Memória (500) + Texto (1500) = ~2000 chars (Limite seguro de URL é ~2048 a 4096 dependendo do server)
+                contextForUrl = `MEMÓRIA: ${currentMemory.slice(0, 500)}\n\nRESUMO DA REUNIÃO:\n${cleanContent}`;
+
             } else {
-                // ABA FINAL: Relatório
+                // ABA FINAL (DIRETOR DE CS)
                 prompt = `ATUE COMO DIRETOR DE CS. ESTA É A ÚLTIMA REUNIÃO (${tab.title}).
-                
-                HISTÓRICO ACUMULADO: 
-                ${currentMemory}
-                
-                CONTEÚDO DA ÚLTIMA REUNIÃO:
-                ${tabContentSafe}
                 
                 --- MISSÃO FINAL ---
                 Gere o Relatório de Inteligência.
                 
                 REGRAS:
-                1. **Checkpoints/Próximos Passos:** Use SOMENTE o texto da "ÚLTIMA REUNIÃO".
+                1. **Checkpoints/Próximos Passos:** Use SOMENTE o texto da "ÚLTIMA REUNIÃO" abaixo.
                 2. **Sentimento/Perfil:** Use o HISTÓRICO + ÚLTIMA REUNIÃO.
                 
-                SAÍDA JSON ESTRITO:
-                {
-                    "resumo_executivo": "Visão geral do status.",
-                    "perfil_cliente": "Análise psicológica.",
-                    "estrategia_relacionamento": "Ação recomendada.",
-                    "checkpoints_feitos": ["O que foi entregue NESTA ÚLTIMA sessão?"],
-                    "proximos_passos": ["O que ficou para a PRÓXIMA?"],
-                    "riscos_bloqueios": "Alertas ativos.",
-                    "sentimento_score": "0 a 10",
-                    "status_projeto": "Em Dia/Atrasado"
-                }`;
+                JSON ESTRITO:
+                {"resumo_executivo": "...", "perfil_cliente": "...", "estrategia_relacionamento": "...", "checkpoints_feitos": [], "proximos_passos": [], "riscos_bloqueios": "...", "sentimento_score": "0-10", "status_projeto": "Em Dia/Atrasado"}`;
+
+                contextForUrl = `HISTÓRICO: ${currentMemory.slice(0, 800)}\n\nÚLTIMA REUNIÃO:\n${cleanContent}`;
             }
 
-            // Retry Logic com Timeout Maior
+            // CHAMADA GET (Strict)
             let respostaIA = "";
-            let apiError = "";
-            
             for (let retry = 0; retry < 2; retry++) {
                 try {
                     const response = await axios.get(`${BASE_URL}/openai/question`, {
                         params: {
                             aiName: BOT_NAME,
                             aiId: BOT_ID,
-                            question: prompt
+                            question: prompt,
+                            context: contextForUrl // O contexto agora é seguro e sem transcrição
                         },
                         headers: { 'Authorization': authHeader },
-                        timeout: 60000 // 60 segundos de timeout!
+                        timeout: 30000
                     });
                     
                     const tResp = response.data.text || response.data.answer;
-                    if (tResp && tResp.trim().length > 5) {
+                    if (tResp && tResp.trim().length > 2) {
                         respostaIA = tResp;
                         break; 
-                    } else {
-                        apiError = "Resposta vazia da IA";
                     }
                 } catch (e) { 
-                    apiError = e.message;
-                    console.error(`Erro IA Aba ${i} (Tentativa ${retry+1}):`, e.message); 
+                    console.error(`Erro IA Aba ${i}: ${e.message}`);
+                    // Se der 414 mesmo assim, tenta cortar mais
+                    if (e.response && e.response.status === 414) {
+                        try {
+                            const superSafeContext = contextForUrl.slice(0, 1000); // Corte drástico
+                            const r2 = await axios.get(`${BASE_URL}/openai/question`, {
+                                params: { aiName: BOT_NAME, aiId: BOT_ID, question: prompt, context: superSafeContext },
+                                headers: { 'Authorization': authHeader }
+                            });
+                            respostaIA = r2.data.text || r2.data.answer;
+                        } catch(e2) {}
+                    }
                 }
             }
 
             if (respostaIA) {
-                currentMemory = respostaIA; 
-                debugLogs.push(`> Sucesso Aba ${i+1}`);
+                currentMemory = respostaIA;
             } else {
-                debugLogs.push(`> FALHA Aba ${i+1}: ${apiError}`);
+                debugLogs.push(`Falha Aba ${tab.title}`);
             }
         }
 
-        // 4. VERIFICAÇÃO FINAL
+        // 4. RENDERIZAÇÃO
         const jsonOnly = extractJSON(currentMemory);
         let data = {};
 
         try {
             data = JSON.parse(jsonOnly);
         } catch (e) {
-            // Se falhou, retorna os logs para você entender o que aconteceu
-            return res.json({ 
-                success: false, 
-                error: "Falha na IA. Logs de Execução:",
-                details: debugLogs 
-            });
+            data = { resumo_executivo: "Erro processamento. Logs: " + debugLogs.join(", ") };
         }
 
         const score = parseInt(data.sentimento_score) || 5;
@@ -342,13 +353,13 @@ app.post('/api/resumir-empresa', async (req, res) => {
         if (score >= 8) scoreColor = "text-emerald-400 border-emerald-500/30 bg-emerald-500/10";
         if (score <= 4) scoreColor = "text-red-400 border-red-500/30 bg-red-500/10";
 
-        const lastTabName = allTabs[allTabs.length-1].title;
+        const lastTabName = allTabs.length > 0 ? allTabs[allTabs.length-1].title : "N/A";
 
         const htmlResumo = `
             <div class="space-y-4 font-sans">
                 <div class="flex items-center justify-between mb-2">
                     <span class="text-[9px] uppercase font-mono text-indigo-300 bg-indigo-500/10 px-2 py-1 rounded border border-indigo-500/20">
-                        📅 Base: ${lastTabName}
+                        📅 Ref: ${lastTabName}
                     </span>
                 </div>
 
@@ -360,44 +371,44 @@ app.post('/api/resumir-empresa', async (req, res) => {
                     <div class="bg-[#0f172a] p-2.5 rounded border border-white/5 hover:border-indigo-500/30 transition-colors">
                         <div class="flex items-center gap-2 mb-1">
                             <i data-lucide="brain" class="w-3 h-3 text-purple-400"></i>
-                            <span class="text-[10px] font-bold text-purple-200 uppercase tracking-wide">Perfil (Histórico)</span>
+                            <span class="text-[10px] font-bold text-purple-200 uppercase tracking-wide">Perfil</span>
                         </div>
                         <p class="text-[10px] text-slate-400 leading-snug">${data.perfil_cliente || "-"}</p>
                     </div>
                     <div class="bg-[#0f172a] p-2.5 rounded border border-white/5 hover:border-emerald-500/30 transition-colors">
                         <div class="flex items-center gap-2 mb-1">
                             <i data-lucide="compass" class="w-3 h-3 text-emerald-400"></i>
-                            <span class="text-[10px] font-bold text-emerald-200 uppercase tracking-wide">Estratégia</span>
+                            <span class="text-[10px] font-bold text-emerald-200 uppercase tracking-wide">Ação</span>
                         </div>
                         <p class="text-[10px] text-slate-400 leading-snug italic">"${data.estrategia_relacionamento || "-"}"</p>
                     </div>
                 </div>
 
                 <div class="grid grid-cols-1 gap-2">
-                    ${(data.checkpoints_feitos && data.checkpoints_feitos.length > 0) ? `
+                    ${(data.checkpoints_feitos || []).length > 0 ? `
                     <div class="bg-white/[0.02] p-2 rounded border border-white/5">
-                        <h4 class="text-[10px] font-bold text-slate-500 uppercase mb-2 flex items-center gap-1"><i data-lucide="check-circle-2" class="w-3 h-3"></i> Feito na Última Sessão</h4>
+                        <h4 class="text-[10px] font-bold text-slate-500 uppercase mb-2 flex items-center gap-1"><i data-lucide="check-circle-2" class="w-3 h-3"></i> Concluído (${lastTabName})</h4>
                         <ul class="space-y-1">
-                            ${data.checkpoints_feitos.map(i => `<li class="text-[10px] text-slate-400 flex items-start gap-2"><span class="w-1 h-1 bg-green-500/50 rounded-full mt-1.5"></span><span class="flex-1">${i}</span></li>`).join('')}
+                            ${(data.checkpoints_feitos || []).map(i => `<li class="text-[10px] text-slate-400 flex items-start gap-2"><span class="w-1 h-1 bg-green-500/50 rounded-full mt-1.5"></span><span class="flex-1">${i}</span></li>`).join('')}
                         </ul>
                     </div>` : ''}
                     
-                    ${(data.proximos_passos && data.proximos_passos.length > 0) ? `
+                    ${(data.proximos_passos || []).length > 0 ? `
                     <div class="bg-indigo-500/[0.05] p-2 rounded border border-indigo-500/20">
-                        <h4 class="text-[10px] font-bold text-indigo-400 uppercase mb-2 flex items-center gap-1"><i data-lucide="arrow-right-circle" class="w-3 h-3"></i> Para a Próxima</h4>
+                        <h4 class="text-[10px] font-bold text-indigo-400 uppercase mb-2 flex items-center gap-1"><i data-lucide="arrow-right-circle" class="w-3 h-3"></i> Próximos</h4>
                         <ul class="space-y-1">
-                            ${data.proximos_passos.map(i => `<li class="text-[10px] text-indigo-200 flex items-start gap-2"><span class="w-1 h-1 bg-indigo-400 rounded-full mt-1.5"></span><span class="flex-1">${i}</span></li>`).join('')}
+                            ${(data.proximos_passos || []).map(i => `<li class="text-[10px] text-indigo-200 flex items-start gap-2"><span class="w-1 h-1 bg-indigo-400 rounded-full mt-1.5"></span><span class="flex-1">${i}</span></li>`).join('')}
                         </ul>
                     </div>` : ''}
                 </div>
 
                 <div class="flex gap-2 items-stretch">
-                    <div class="flex-1 ${data.riscos_bloqueios && data.riscos_bloqueios.length > 5 ? 'bg-red-500/10 border-red-500/20' : 'bg-slate-800/50 border-white/5'} border p-2 rounded flex flex-col justify-center">
-                        <span class="text-[9px] uppercase font-bold ${data.riscos_bloqueios && data.riscos_bloqueios.length > 5 ? 'text-red-400' : 'text-slate-500'} block mb-1">Alertas</span>
-                        <p class="text-[10px] ${data.riscos_bloqueios && data.riscos_bloqueios.length > 5 ? 'text-red-200' : 'text-slate-500'} leading-tight">${data.riscos_bloqueios || "Tudo sob controle."}</p>
+                    <div class="flex-1 bg-slate-800/50 border-white/5 border p-2 rounded flex flex-col justify-center">
+                        <span class="text-[9px] uppercase font-bold text-slate-500 block mb-1">Riscos</span>
+                        <p class="text-[10px] text-slate-400 leading-tight">${data.riscos_bloqueios || "Nenhum."}</p>
                     </div>
                     <div class="w-16 flex flex-col items-center justify-center p-1 rounded border ${scoreColor}">
-                        <span class="text-[8px] uppercase font-bold opacity-70">Humor</span>
+                        <span class="text-[8px] uppercase font-bold opacity-70">Score</span>
                         <span class="text-xl font-bold">${score}</span>
                         <span class="text-[8px] opacity-70">/10</span>
                     </div>
@@ -418,11 +429,11 @@ app.post('/api/resumir-empresa', async (req, res) => {
         res.json({ success: true, data: updatePayload });
 
     } catch (error) {
-        console.error(`[ERRO CRÍTICO] ${step}:`, error.message);
-        res.status(500).json({ error: "Falha de processamento", step, details: error.message });
+        res.status(500).json({ error: "Falha processamento", details: error.message });
     }
 });
 
+// --- ROTA TESTE ---
 app.get('/api/debug-bot', async (req, res) => {
     try {
         const rawToken = getHeadOfficeToken();
