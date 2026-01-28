@@ -15,13 +15,14 @@ const supabase = createClient(
     process.env.SUPABASE_KEY || ''
 );
 
-// URL Base (Note a escrita correta 'openai')
+// URL Base
 const BASE_URL = 'https://api.headoffice.ai/v1';
 const SHEET_FULL_URL = 'https://docs.google.com/spreadsheets/d/1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM/edit?gid=0#gid=0';
 
 // --- ROTA 1: DASHBOARD ---
 app.get('/', (req, res) => {
     const currentUrl = `https://${req.headers.host}`;
+    // Substitui a URL hardcoded pela URL atual do deploy
     const htmlComUrl = DASHBOARD_HTML.replace('https://head-office-one.vercel.app', currentUrl);
     res.send(htmlComUrl);
 });
@@ -42,23 +43,31 @@ app.post('/api/empresas', async (req, res) => {
     res.json({ success: true, data });
 });
 
-// --- ROTA 4: RESUMIR EMPRESA (Estratégia 2-Passos GET) ---
+// --- ROTA 4: RESUMIR EMPRESA (Usando JWT) ---
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
-    const HEADOFFICE_API_KEY = process.env.HEADOFFICE_API_KEY;
+    
+    // MUDANÇA: Agora usamos o JWT
+    const HEADOFFICE_JWT = process.env.HEADOFFICE_JWT;
+    
+    // CHECK DE SEGURANÇA
+    if (!HEADOFFICE_JWT) {
+        return res.status(500).json({ error: "HEADOFFICE_JWT não configurado na Vercel." });
+    }
+
     let step = "Início";
 
     try {
-        // --- PASSO 1: Descobrir o Link (Request Leve) ---
+        // --- PASSO 1: Descobrir o Link ---
         step = "Buscando Link na Planilha";
         
-        // Usamos /openai/question pois é mais leve que communication
         const linkResponse = await axios.get(`${BASE_URL}/openai/question`, {
             params: {
                 context: `Planilha: ${SHEET_FULL_URL}`,
                 question: `Qual é a URL do documento (Link Docs) da empresa "${nome}"? Retorne APENAS a URL, sem texto.`
             },
-            headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` }
+            // MUDANÇA: Authorization Bearer com JWT
+            headers: { 'Authorization': `Bearer ${HEADOFFICE_JWT}` }
         });
 
         const answerLink = linkResponse.data.answer || "";
@@ -69,16 +78,15 @@ app.post('/api/resumir-empresa', async (req, res) => {
             return res.json({ success: false, error: `Link da empresa "${nome}" não encontrado na planilha.` });
         }
 
-        // --- PASSO 2: Resumir o Documento (Request Médio) ---
+        // --- PASSO 2: Resumir o Documento ---
         step = "Lendo Documento Encontrado";
         
-        // Agora o contexto é o link específico, não a planilha toda. Isso economiza tokens e evita erro 500.
         const summaryResponse = await axios.get(`${BASE_URL}/openai/question`, {
             params: {
                 context: `Documento: ${docUrl}`,
                 question: `Leia a ÚLTIMA sessão (data mais recente). Retorne JSON estrito: {"resumo": "...", "pontos_importantes": "...", "status_cliente": "Satisfeito/Crítico", "status_projeto": "Em Dia/Atrasado"}`
             },
-            headers: { 'Authorization': `Bearer ${HEADOFFICE_API_KEY}` }
+            headers: { 'Authorization': `Bearer ${HEADOFFICE_JWT}` }
         });
 
         // --- TRATAMENTO ---
@@ -113,7 +121,6 @@ app.post('/api/resumir-empresa', async (req, res) => {
     } catch (error) {
         console.error(`Erro no passo [${step}]:`, error.message);
         
-        // Retorna erro amigável
         const errorMsg = error.response 
             ? `Erro API HeadOffice (${error.response.status}): ${JSON.stringify(error.response.data)}` 
             : error.message;
@@ -124,7 +131,7 @@ app.post('/api/resumir-empresa', async (req, res) => {
 
 module.exports = app;
 
-// --- FRONTEND IGUAL AO ANTERIOR ---
+// --- FRONTEND (Dashboard) ---
 const DASHBOARD_HTML = `
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -147,7 +154,9 @@ const DASHBOARD_HTML = `
 </head>
 <body class="min-h-screen p-6 md:p-12">
     <script>const API_URL = 'https://head-office-one.vercel.app';</script>
+    
     <div class="stars" id="starsContainer"></div>
+    
     <div class="max-w-7xl mx-auto">
         <header class="flex flex-col md:flex-row justify-between items-center mb-8 gap-4">
             <div>
