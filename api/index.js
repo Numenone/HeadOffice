@@ -30,7 +30,7 @@ app.get('/', (req, res) => {
     res.send(htmlComUrl);
 });
 
-// --- HELPER AUTH ---
+// --- HELPER AUTH HEADOFFICE ---
 function getHeadOfficeToken() {
     let rawToken = process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
     rawToken = rawToken.trim();
@@ -41,6 +41,7 @@ function getHeadOfficeToken() {
     return rawToken.length > 10 ? rawToken : null;
 }
 
+// --- HELPER AUTH GOOGLE ---
 function getGoogleAuth() {
     const privateKey = process.env.GOOGLE_PRIVATE_KEY 
         ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') 
@@ -55,7 +56,10 @@ function getGoogleAuth() {
             client_email: process.env.GOOGLE_CLIENT_EMAIL,
             private_key: privateKey,
         },
-        scopes: ['https://www.googleapis.com/auth/documents.readonly'],
+        scopes: [
+            'https://www.googleapis.com/auth/documents.readonly',
+            'https://www.googleapis.com/auth/spreadsheets.readonly'
+        ],
     });
 }
 
@@ -65,7 +69,6 @@ function parseDateFromTitle(title) {
     const lower = title.toLowerCase();
     const meses = { "jan": 0, "fev": 1, "mar": 2, "abr": 3, "mai": 4, "jun": 5, "jul": 6, "ago": 7, "set": 8, "out": 9, "nov": 10, "dez": 11 };
     
-    // Formato extenso (14 de jan)
     const regexExt = /(\d{1,2})\s*(?:de)?\s*([a-zç]{3,})(?:\.|,)?/;
     let match = lower.match(regexExt);
     if (match) {
@@ -79,7 +82,6 @@ function parseDateFromTitle(title) {
         return new Date(year, month, day);
     }
 
-    // Formato numérico
     const regexNum = /(\d{1,2})[\/\.\-](\d{1,2})(?:[\/\.\-](\d{2,4}))?/;
     match = lower.match(regexNum);
     if (match) {
@@ -128,7 +130,6 @@ function optimizeTextForGet(text) {
     if (!text) return "";
     let clean = text;
 
-    // Remove Lixo
     const lower = clean.toLowerCase();
     const endMarkers = ["revise as anotações do gemini", "00:00:00", "transcrição\n", "registros da reunião transcrição"];
     let cutoff = clean.length;
@@ -142,7 +143,6 @@ function optimizeTextForGet(text) {
     const MAX = 1600;
     if (clean.length <= MAX) return clean;
 
-    // Sniper: Busca "Próximos Passos"
     const stepsMarkers = ["próximas etapas", "próximos passos", "ações futuras", "encaminhamentos"];
     let stepsIdx = -1;
     for (const sm of stepsMarkers) {
@@ -151,9 +151,9 @@ function optimizeTextForGet(text) {
     }
 
     if (stepsIdx !== -1) {
-        const head = clean.substring(0, 700);
-        const stepsBlock = clean.substring(stepsIdx, stepsIdx + 900);
-        return `${head} ... [OMITIDO] ... ${stepsBlock}`;
+        const head = clean.substring(0, 800);
+        const tail = clean.substring(stepsIdx, stepsIdx + 800);
+        return `${head} ... [OMITIDO] ... ${tail}`;
     } else {
         const head = clean.substring(0, 900);
         const tail = clean.substring(clean.length - 700);
@@ -161,6 +161,36 @@ function optimizeTextForGet(text) {
     }
 }
 
+// --- BUSCA PLANILHA (VIA API GOOGLE) ---
+async function findDocLinkInSheet(companyName) {
+    const auth = getGoogleAuth();
+    const client = await auth.getClient();
+    const sheets = google.sheets({ version: 'v4', auth: client });
+
+    try {
+        const res = await sheets.spreadsheets.values.get({
+            spreadsheetId: SHEET_ID,
+            range: 'A:Z', 
+        });
+
+        const rows = res.data.values;
+        if (!rows || rows.length === 0) return null;
+
+        for (const row of rows) {
+            const strRow = row.join(' ').toLowerCase();
+            if (strRow.includes(companyName.toLowerCase())) {
+                const link = row.find(cell => cell.includes('docs.google.com/document/d/'));
+                if (link) return link;
+            }
+        }
+        return null;
+    } catch (error) {
+        if (error.code === 403) throw new Error("Acesso negado à Planilha.");
+        throw error;
+    }
+}
+
+// --- BUSCA ABAS DO DOC ---
 async function getAllTabsSorted(docId) {
     const auth = getGoogleAuth();
     const client = await auth.getClient();
@@ -199,19 +229,12 @@ async function generateCompanyIntelligence(nome, id, authHeader) {
 
     // 1. Achar Link
     try {
-        const csvResponse = await axios.get(SHEET_CSV_URL);
-        const lines = csvResponse.data.split('\n');
-        for (const line of lines) {
-            if (line.toLowerCase().includes(nome.toLowerCase())) {
-                const match = line.match(/\/d\/([a-zA-Z0-9_-]+)/);
-                if (match) { 
-                    docId = match[1];
-                    docUrl = `https://docs.google.com/document/d/${docId}`;
-                    break; 
-                }
-            }
+        docUrl = await findDocLinkInSheet(nome);
+        if (docUrl) {
+            const match = docUrl.match(/\/d\/([a-zA-Z0-9_-]+)/);
+            if (match) docId = match[1];
         }
-    } catch (e) { throw new Error("Erro ao ler CSV: " + e.message); }
+    } catch (e) { throw new Error("Erro Planilha: " + e.message); }
 
     if (!docId) throw new Error(`Link não encontrado para ${nome}.`);
 
@@ -231,36 +254,35 @@ async function generateCompanyIntelligence(nome, id, authHeader) {
         let contextForUrl = "";
 
         if (!isLast) {
-            prompt = `ATUE COMO CS MANAGER. REUNIÃO PASSADA: ${tab.title}. INSTRUÇÃO: Atualize a memória com o SENTIMENTO do cliente (ele reclamou? elogiou? rejeitou algo?). Seja conciso.`;
+            prompt = `ATUE COMO CS MANAGER. REUNIÃO PASSADA: ${tab.title}. INSTRUÇÃO: Atualize a memória com o SENTIMENTO do cliente (ele reclamou? elogiou?). Seja conciso.`;
             contextForUrl = `MEMÓRIA: ${currentMemory.slice(0, 500)}\n\nRESUMO: ${cleanContent}`;
         } else {
-            // PROMPT DO DIRETOR - CORREÇÃO DE SENTIMENTO
-            prompt = `ATUE COMO DIRETOR DE CS SÊNIOR. ESTA É A ÚLTIMA REUNIÃO (${tab.title}).
-
-                --- MISSÃO FINAL ---
-
-                Gere o Relatório de Inteligência Estratégico.
-
+            // PROMPT ATUALIZADO: Foco em HUMOR, não em TAREFAS
+            prompt = `ATUE COMO DIRETOR DE CS. ÚLTIMA REUNIÃO (${tab.title}).
             
+            --- MISSÃO FINAL ---
+
+            Gere o Relatório de Inteligência Estratégico.
+
             GERE RELATÓRIO JSON:
             {"resumo_executivo": "...", "perfil_cliente": "...", "estrategia_relacionamento": "...", "checkpoints_feitos": [], "proximos_passos": [], "riscos_bloqueios": "...", "sentimento_score": "0-10"}
             
             REGRAS RÍGIDAS:
             1. 'proximos_passos': Extraia SOMENTE do texto da ÚLTIMA REUNIÃO abaixo.
-            2. 'sentimento_score': NÃO baseie no atraso de tarefas. Baseie na EMOÇÃO/FALA do cliente.
-               - 9-10: Elogios, cliente feliz, "adorei", "muito bom".
-               - 7-8: Cliente parceiro, construtivo, engajado.
-               - 5-6: Neutro, transacional, sem muita emoção.
-               - 3-4: Reclamações pontuais, rejeições de propostas, insatisfação leve.
-               - 0-2: Cliente irritado, ameaça de cancelamento, crise.
-
-            3. Se houver nomes reais (Bianca, Felipe, Deborah, etc...) use-os no relatório.
-            4. 
+            2. 'sentimento_score': AVALIE ESTRITAMENTE O HUMOR E A EMOÇÃO DO CLIENTE.
+               - NÃO deduza o score baseado em tarefas atrasadas ou cronograma.
+               - 9-10: Cliente apaixonado, elogios explícitos ("excelente", "muito bom").
+               - 7-8: Cliente feliz, colaborativo, tom positivo e construtivo.
+               - 5-6: Neutro, profissional, transacional (sem emoção).
+               - 3-4: Cliente demonstrou insatisfação, rejeitou entregas ou reclamou levemente.
+               - 0-2: Cliente irritado, grosso, ameaça de cancelamento ou crise.
+            3. Use o "TEXTO DA ÚLTIMA REUNIÃO" para preencher 'checkpoints_feitos' e 'proximos_passos'.
+            4. Se o texto citar Felipe, Barbara, William, use os nomes.
+            5. Nunca fabrique dados ou invente tarefas.
             
-            Se o projeto está atrasado mas o cliente está tranquilo, a nota é ALTA.
-            Se o projeto está em dia mas o cliente foi grosso, a nota é BAIXA.`;
+            IMPORTANTE: Se o projeto está pegando fogo (atrasado) mas o cliente está calmo e parceiro, a nota DEVE SER ALTA (7+).`;
             
-            contextForUrl = `HISTÓRICO Prévio (Perfil/Sentimento): ${currentMemory.slice(0, 600)}\n\nTEXTO DA ÚLTIMA REUNIÃO (Checkpoints/Próximos Passos):\n${cleanContent}`;
+            contextForUrl = `Histórico Prévio (Perfil/Sentimento): ${currentMemory.slice(0, 600)}\n\nTEXTO DA ÚLTIMA REUNIÃO (Checkpoints/Próximos Passos):\n${cleanContent}`;
         }
 
         let respostaIA = "";
@@ -274,7 +296,6 @@ async function generateCompanyIntelligence(nome, id, authHeader) {
                 const tResp = response.data.text || response.data.answer;
                 if (tResp && tResp.trim().length > 2) { respostaIA = tResp; break; }
             } catch (e) {
-                // Fallback
                 if (e.response && e.response.status === 414) {
                     try {
                         const mini = contextForUrl.slice(0, 500);
@@ -290,8 +311,6 @@ async function generateCompanyIntelligence(nome, id, authHeader) {
 
         if (respostaIA) {
             currentMemory = respostaIA;
-        } else {
-            debugLogs.push(`Falha aba ${tab.title}`);
         }
     }
 
@@ -302,16 +321,25 @@ async function generateCompanyIntelligence(nome, id, authHeader) {
 
     const score = parseInt(data.sentimento_score) || 5;
     
-    // LÓGICA DE STATUS ALINHADA AO SENTIMENTO
+    // NOVA LÓGICA DE STATUS (5 NÍVEIS)
     let status_cliente = "Neutro";
     let scoreColor = "text-yellow-400 border-yellow-500/30 bg-yellow-500/10";
     
-    if (score <= 4) {
-        status_cliente = "Crítico";
-        scoreColor = "text-red-400 border-red-500/30 bg-red-500/10";
+    if (score >= 9) {
+        status_cliente = "Extremamente Satisfeito";
+        scoreColor = "text-purple-400 border-purple-500/30 bg-purple-500/10";
     } else if (score >= 7) {
         status_cliente = "Satisfeito";
         scoreColor = "text-emerald-400 border-emerald-500/30 bg-emerald-500/10";
+    } else if (score >= 5) {
+        status_cliente = "Neutro";
+        scoreColor = "text-yellow-400 border-yellow-500/30 bg-yellow-500/10";
+    } else if (score >= 3) {
+        status_cliente = "Insatisfeito";
+        scoreColor = "text-orange-400 border-orange-500/30 bg-orange-500/10";
+    } else {
+        status_cliente = "Crítico";
+        scoreColor = "text-red-400 border-red-500/30 bg-red-500/10";
     }
 
     const lastTabName = allTabs[allTabs.length-1].title;
@@ -392,10 +420,10 @@ app.post('/api/resumir-empresa', async (req, res) => {
     }
 });
 
-// --- ROTA CRON ---
+// --- ROTA CRON (DIÁRIA) ---
 app.get('/api/cron/daily-sync', async (req, res) => {
     const authHeader = getHeadOfficeToken();
-    if (!authHeader) return res.status(500).json({ error: "Token HeadOffice não configurado." });
+    if (!authHeader) return res.status(500).json({ error: "Token não configurado." });
 
     try {
         const { data: companies } = await supabase.from('empresas').select('*');
@@ -433,7 +461,7 @@ app.post('/api/empresas', async (req, res) => {
 
 module.exports = app;
 
-// --- FRONTEND (MANTIDO) ---
+// --- FRONTEND ATUALIZADO ---
 const DASHBOARD_HTML = `
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -449,9 +477,13 @@ const DASHBOARD_HTML = `
         .glass-card { background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3); transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
         .glass-card:hover { border-color: rgba(99, 102, 241, 0.4); transform: translateY(-4px); box-shadow: 0 20px 40px -10px rgba(99, 102, 241, 0.15); background: rgba(30, 41, 59, 0.7); }
         .badge { padding: 4px 10px; border-radius: 99px; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid; box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
+        
+        .st-ExtremamenteSatisfeito { background: rgba(168, 85, 247, 0.15); color: #c084fc; border-color: rgba(168, 85, 247, 0.3); }
         .st-Satisfeito { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
-        .st-Crítico { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border-color: rgba(239, 68, 68, 0.3); }
         .st-Neutro { background: rgba(250, 204, 21, 0.15); color: #fde047; border-color: rgba(250, 204, 21, 0.3); }
+        .st-Insatisfeito { background: rgba(249, 115, 22, 0.15); color: #fdba74; border-color: rgba(249, 115, 22, 0.3); }
+        .st-Crítico { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border-color: rgba(239, 68, 68, 0.3); }
+        
         .bg-grid { background-image: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px); background-size: 30px 30px; }
     </style>
 </head>
@@ -472,8 +504,10 @@ const DASHBOARD_HTML = `
             <div class="flex items-center gap-3 w-full md:w-auto">
                 <select id="statusFilter" onchange="loadCompanies()" class="bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 block p-2.5">
                     <option value="Todos">Todos os Status</option>
+                    <option value="Extremamente Satisfeito">🟣 Extremamente Satisfeito</option>
                     <option value="Satisfeito">🟢 Satisfeito</option>
                     <option value="Neutro">🟡 Neutro</option>
+                    <option value="Insatisfeito">🟠 Insatisfeito</option>
                     <option value="Crítico">🔴 Crítico</option>
                 </select>
                 <div class="relative group">
@@ -507,7 +541,7 @@ const DASHBOARD_HTML = `
                     return; 
                 }
                 data.forEach(emp => {
-                    let sCli = (emp.status_cliente || 'Neutro').trim();
+                    let sCli = (emp.status_cliente || 'Neutro').trim().replace(/\\s/g, '');
                     const contentHtml = emp.resumo && emp.resumo.includes('<div') 
                         ? emp.resumo 
                         : \`<div class="flex flex-col items-center justify-center h-40 text-slate-500 gap-2"><i data-lucide="ghost" class="w-6 h-6 opacity-30"></i><p class="text-xs">Sem inteligência gerada.</p></div>\`;
@@ -520,7 +554,7 @@ const DASHBOARD_HTML = `
                                 \${emp.doc_link ? \`<a href="\${emp.doc_link}" target="_blank" class="text-slate-600 hover:text-white transition-colors p-1 hover:bg-white/10 rounded"><i data-lucide="file-text" class="w-4 h-4"></i></a>\` : ''}
                             </div>
                             <div class="flex gap-2">
-                                <span class="badge st-\${sCli}">\${sCli}</span>
+                                <span class="badge st-\${sCli}">\${emp.status_cliente || 'Neutro'}</span>
                             </div>
                         </div>
                         <div class="p-5 flex-grow text-sm">
