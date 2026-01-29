@@ -28,6 +28,7 @@ app.get('/', (req, res) => {
     const currentUrl = `https://${req.headers.host}`;
     const htmlComUrl = DASHBOARD_HTML.replace('https://head-office-one.vercel.app', currentUrl);
     res.send(htmlComUrl);
+    res.send(DASHBOARD_HTML);
 });
 
 // --- HELPER AUTH ---
@@ -455,6 +456,7 @@ const DASHBOARD_HTML = `
             lucide.createIcons();
             try {
                 const res = await fetch(API_URL + '/api/empresas');
+                const res = await fetch('/api/empresas');
                 const data = await res.json();
                 grid.innerHTML = '';
                 if(data.length === 0) { grid.innerHTML = '<div class="col-span-full text-center text-slate-600 py-32 font-mono">NO ACTIVE CLIENTS.</div>'; return; }
@@ -520,6 +522,7 @@ const DASHBOARD_HTML = `
             
             try {
                 const res = await fetch(API_URL + '/api/resumir-empresa', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nome, id }) });
+                const res = await fetch('/api/resumir-empresa', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nome, id }) });
                 const json = await res.json();
                 if (json.success) { loadCompanies(); } else { throw new Error(json.details || json.error); }
             } catch (e) { 
@@ -541,6 +544,23 @@ const DASHBOARD_HTML = `
             const nome = input.value.trim();
             if(!nome) return;
             try { const res = await fetch(API_URL + '/api/empresas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nome }) }); const json = await res.json(); if(json.success) { input.value = ''; loadCompanies(); } } catch(e) {}
+            if(!nome) {
+                alert('Por favor, insira um nome para a empresa.');
+                return;
+            }
+            try {
+                const res = await fetch('/api/empresas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nome }) });
+                const json = await res.json();
+                if (res.ok && json.success) {
+                    input.value = '';
+                    loadCompanies();
+                } else {
+                    throw new Error(json.error || 'Ocorreu uma falha ao adicionar a empresa.');
+                }
+            } catch(e) {
+                console.error('Falha ao adicionar empresa:', e);
+                alert('Erro ao adicionar empresa: ' + e.message);
+            }
         }
         function openHistoryModal(history, companyName) {
             if (!history || history.length < 2) return;
