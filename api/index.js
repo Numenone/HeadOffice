@@ -258,27 +258,22 @@ app.post('/api/empresas', async (req, res) => {
 // LÓGICA DE INTELIGÊNCIA (DIRECTOR MODE + SNIPER)
 // ======================================================
 
-async function processCompanyIntelligence(id, nome, existingHistory = null) {
+async function processCompanyIntelligence(id, nome) {
     const authHeader = getHeadOfficeToken();
-    if (!authHeader) return { success: false, error: "Token HeadOffice inválido." };
-
+    
     let docId = null;
     let docUrl = null;
-    let history = existingHistory || [];
+
+    if (!authHeader) return { success: false, error: "Token HeadOffice inválido." };
+
+    let history = [];
+    try {
+        const { data: companyData, error: historyError } = await supabase.from('empresas').select('score_history').eq('id', id).single();
+        if (historyError) throw new Error(`Falha ao buscar histórico do Supabase: ${historyError.message}`);
+        history = companyData?.score_history || [];
+    } catch (e) { console.warn(`Erro ao buscar histórico para ${nome}: ${e.message}`); }
 
     try {
-        // Se não veio histórico, busca no banco
-        if (!existingHistory) {
-            const { data: companyData, error: historyError } = await supabase
-                .from('empresas')
-                .select('score_history')
-                .eq('id', id)
-                .single();
-            
-            if (historyError) throw historyError;
-            history = companyData?.score_history || [];
-        }
-
         // 1. LINK NO CSV
         try {
             const csvResponse = await axios.get(SHEET_CSV_URL);
@@ -286,16 +281,14 @@ async function processCompanyIntelligence(id, nome, existingHistory = null) {
             for (const line of lines) {
                 if (line.toLowerCase().includes(nome.toLowerCase())) {
                     const match = line.match(/\/d\/([a-zA-Z0-9_-]+)/);
-                    if (match) {
+                    if (match) { 
                         docId = match[1];
                         docUrl = `https://docs.google.com/document/d/${docId}`;
-                        break;
+                        break; 
                     }
                 }
             }
-        } catch (e) {
-            console.warn(`CSV Error para ${nome}: ${e.message}`);
-        }
+        } catch (e) { console.warn(`CSV Error para ${nome}`); }
 
         if (!docId) return { success: false, error: `Link não encontrado para ${nome}.` };
 
@@ -540,8 +533,8 @@ async function processCompanyIntelligence(id, nome, existingHistory = null) {
             doc_link: docUrl,
             resumo: htmlResumo,
             pontos_importantes: "Ver card",
-            score_history: updatedHistory,
             status_cliente: statusCliente,
+            score_history: updatedHistory,
             last_updated: new Date()
         };
 
@@ -622,13 +615,6 @@ const DASHBOARD_HTML = `
         .glass-card { background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3); transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
         .glass-card:hover { border-color: rgba(99, 102, 241, 0.4); transform: translateY(-4px); box-shadow: 0 20px 40px -10px rgba(99, 102, 241, 0.15); background: rgba(30, 41, 59, 0.7); }
         .badge { padding: 4px 10px; border-radius: 99px; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid; box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
-        /* Status Cliente */
-        .st-ExtremamenteSatisfeito { background: rgba(6, 182, 212, 0.1); color: #22d3ee; border-color: rgba(6, 182, 212, 0.3); }
-        .st-Satisfeito { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
-        .st-Neutro { background: rgba(234, 179, 8, 0.1); color: #facc15; border-color: rgba(234, 179, 8, 0.3); }
-        .st-Insatisfeito { background: rgba(249, 115, 22, 0.1); color: #fb923c; border-color: rgba(249, 115, 22, 0.3); }
-        .st-Crítico { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border-color: rgba(239, 68, 68, 0.3); }
-        .bg-grid { background-image: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px); background-size: 30px 30px; }
         .is-unlinked {
             opacity: 0.6;
             filter: grayscale(60%);
@@ -639,6 +625,17 @@ const DASHBOARD_HTML = `
             filter: grayscale(0%);
             transform: translateY(-4px);
         }
+        /* Status Cliente */
+        .st-ExtremamenteSatisfeito { background: rgba(6, 182, 212, 0.1); color: #22d3ee; border-color: rgba(6, 182, 212, 0.3); }
+        .st-Satisfeito { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
+        .st-Neutro { background: rgba(234, 179, 8, 0.1); color: #facc15; border-color: rgba(234, 179, 8, 0.3); }
+        .st-Insatisfeito { background: rgba(249, 115, 22, 0.1); color: #fb923c; border-color: rgba(249, 115, 22, 0.3); }
+        .st-Crítico { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border-color: rgba(239, 68, 68, 0.3); }
+        /* Status Projeto (Exemplos) */
+        .st-EmDia { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
+        .st-EmAnálise { background: rgba(148, 163, 184, 0.15); color: #e2e8f0; border-color: rgba(148, 163, 184, 0.3); }
+        .st-Atrasado, .st-Risco { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border-color: rgba(239, 68, 68, 0.3); }
+        .bg-grid { background-image: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px); background-size: 30px 30px; }
     </style>
 </head>
 <body class="min-h-screen bg-grid">
@@ -712,53 +709,14 @@ const DASHBOARD_HTML = `
                     return; 
                 }
                 data.forEach(emp => {
-                    const sCli = (emp.status_cliente || 'Neutro').replace(/\s/g, '');
-                    const historyJson = JSON.stringify(emp.score_history || []);
-                    const contentHtml = emp.resumo && emp.resumo.includes('<div') 
-                        ? emp.resumo 
-                        : \`<div class="flex flex-col items-center justify-center h-40 text-slate-500 gap-2"><i data-lucide="ghost" class="w-6 h-6 opacity-30"></i><p class="text-xs">Sem inteligência gerada.</p></div>\`;
-                    grid.innerHTML += \`
-                    <div class="glass-card rounded-2xl flex flex-col h-full relative group company-card" data-status="\${emp.status_cliente || 'Neutro'}">
-                        <div class="p-5 pb-3 border-b border-white/5">
-                            <div class="flex justify-between items-start mb-3">
-                                <h2 class="font-bold text-white text-lg tracking-tight truncate w-10/12 group-hover:text-indigo-300 transition-colors" title="\${emp.nome}">\${emp.nome}</h2>
-                                \${emp.doc_link ? \`<a href="\${emp.doc_link}" target="_blank" class="text-slate-600 hover:text-white transition-colors p-1 hover:bg-white/10 rounded"><i data-lucide="file-text" class="w-4 h-4"></i></a>\` : ''}
-                            </div>
-                            <div class="flex gap-2">
-                                <span class="badge st-\${sCli}">\${emp.status_cliente || 'PENDENTE'}</span>
-                            </div>
-                        </div>
-                        <div class="p-5 flex-grow text-sm">
-                            \${contentHtml}
-                        </div>
-                        <div class="p-4 mt-auto border-t border-white/5 bg-slate-900/30 rounded-b-2xl flex flex-col gap-3">
-                            <div class="flex gap-2">
-                                <button onclick="summarize('\${emp.nome.replace(/'/g, "\\\\'")}', \${emp.id})" id="btn-\${emp.id}" 
-                                    class="flex-grow bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5 group-hover:border-indigo-500/30">
-                                    <i data-lucide="zap" class="w-3 h-3"></i> 
-                                    \${emp.resumo ? 'REPROCESSAR' : 'ANALISAR'}
-                                </button>
-                                <button 
-                                    onclick='if((emp.score_history || []).length > 1) openHistoryModal(${historyJson}, \`\${emp.nome.replace(/'/g, "\\\\'")}\`)'
-                                    class="w-12 flex-shrink-0 flex items-center justify-center bg-slate-800 rounded-lg border border-white/5 \${(emp.score_history || []).length > 1 ? 'hover:bg-indigo-600 hover:border-indigo-500/30 cursor-pointer' : 'opacity-50 cursor-not-allowed'}"
-                                    title="Ver Histórico de Score">
-                                    <i data-lucide="bar-chart-3" class="w-4 h-4 text-slate-300"></i>
-                                </button>
-                            </div>
-                            <div class="flex justify-between items-center px-1">
-                                <span class="text-[9px] text-slate-600 uppercase font-bold tracking-wider">Last Sync</span>
-                                <span class="text-[9px] text-slate-500 font-mono">
-                                    \${emp.last_updated ? new Date(emp.last_updated).toLocaleDateString() : '--/--'}
-                                </span>
-                            </div>
-                        </div>
-                    </div>\`;
+                    grid.innerHTML += generateCardHTML(emp);
                 });
                 lucide.createIcons();
             } catch (e) { 
                 grid.innerHTML = '<div class="col-span-full text-center text-red-400 font-mono py-20">SYSTEM FAILURE: API UNREACHABLE.</div>'; 
             }
         }
+
         function applyFilters() {
             const statusFilter = document.getElementById('statusFilter').value;
             const searchFilter = document.getElementById('searchFilter').value.toLowerCase();
@@ -777,13 +735,238 @@ const DASHBOARD_HTML = `
                 }
             });
         }
+
+        async function summarize(nome, id) {
+            const card = document.getElementById('card-' + id);
+            if (!card) return;
+
+            const loadingOverlay = document.createElement('div');
+            loadingOverlay.className = 'absolute inset-0 bg-slate-900/80 backdrop-blur-sm flex flex-col items-center justify-center z-10 rounded-2xl';
+            loadingOverlay.innerHTML = '<i data-lucide="loader-2" class="animate-spin w-8 h-8 text-indigo-400"></i><p class="mt-3 text-sm text-indigo-300 font-mono">PROCESSANDO...</p>';
+            card.appendChild(loadingOverlay);
+            lucide.createIcons();
+
+            try {
+                const res = await fetch(API_URL + '/api/resumir-empresa', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ nome, id })
+                });
+                const json = await res.json();
+                if (json.success) {
+                    card.outerHTML = generateCardHTML(json.data);
+                    lucide.createIcons();
+                } else {
+                    alert('Erro: ' + (json.details || json.error)); 
+                    card.removeChild(loadingOverlay);
+                }
+            } catch (e) { 
+                alert('Erro de conexão: ' + e.message);
+                if (card.contains(loadingOverlay)) card.removeChild(loadingOverlay);
+            }
+        }
+
+        async function addCompany() {
+            const input = document.getElementById('newCompanyInput');
+            const nome = input.value.trim();
+            if(!nome) return;
+            try {
+                const res = await fetch(API_URL + '/api/empresas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nome }) });
+                const json = await res.json();
+                if(json.success) { input.value = ''; loadCompanies(); }
+            } catch(e) {}
+        }
+
+        function generateCardHTML(emp) {
+            const sCli = (emp.status_cliente || 'Neutro').replace(/\s/g, '');
+            const historyJson = JSON.stringify(emp.score_history || []);
+            const contentHtml = emp.resumo && emp.resumo.includes('<div') 
+                ? emp.resumo 
+                : \`<div class="flex flex-col items-center justify-center h-40 text-slate-500 gap-2"><i data-lucide="ghost" class="w-6 h-6 opacity-30"></i><p class="text-xs">Sem inteligência gerada.</p></div>\`;
+            const isUnlinked = !emp.doc_link;
+
+            return \`
+            <div id="card-\${emp.id}" class="glass-card rounded-2xl flex flex-col h-full relative group company-card \${isUnlinked ? 'is-unlinked' : ''}" data-status="\${emp.status_cliente || 'Neutro'}">
+                <div class="p-5 pb-3 border-b border-white/5">
+                    <div class="flex justify-between items-start mb-3">
+                        <h2 class="font-bold text-white text-lg tracking-tight truncate w-10/12 group-hover:text-indigo-300 transition-colors" title="\${emp.nome}">\${emp.nome}</h2>
+                        \${emp.doc_link ? \`<a href="\${emp.doc_link}" target="_blank" class="text-slate-600 hover:text-white transition-colors p-1 hover:bg-white/10 rounded"><i data-lucide="file-text" class="w-4 h-4"></i></a>\` : ''}
+                    </div>
+                    <div class="flex gap-2">
+                        <span class="badge st-\${sCli}">\${emp.status_cliente || 'PENDENTE'}</span>
+                    </div>
+                </div>
+                <div class="p-5 flex-grow text-sm">
+                    \${contentHtml}
+                </div>
+                <div class="p-4 mt-auto border-t border-white/5 bg-slate-900/30 rounded-b-2xl flex flex-col gap-3">
+                    <div class="flex gap-2">
+                        <button onclick="summarize('\${emp.nome.replace(/'/g, "\\\\'")}', \${emp.id})" id="btn-\${emp.id}" 
+                            class="flex-grow bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5 group-hover:border-indigo-500/30">
+                            <i data-lucide="zap" class="w-3 h-3"></i> 
+                            \${emp.resumo ? 'REPROCESSAR' : 'ANALISAR'}
+                        </button>
+                        <button 
+                            onclick='if(${(emp.score_history || []).length > 1}) openHistoryModal(${historyJson}, \`\${emp.nome.replace(/'/g, "\\\\'")}\`)'
+                            class="w-12 flex-shrink-0 flex items-center justify-center bg-slate-800 rounded-lg border border-white/5 \${(emp.score_history || []).length > 1 ? 'hover:bg-indigo-600 hover:border-indigo-500/30 cursor-pointer' : 'opacity-50 cursor-not-allowed'}"
+                            title="Ver Histórico de Score">
+                            <i data-lucide="bar-chart-3" class="w-4 h-4 text-slate-300"></i>
+                        </button>
+                    </div>
+                    <div class="flex justify-between items-center px-1">
+                        <span class="text-[9px] text-slate-600 uppercase font-bold tracking-wider">Last Sync</span>
+                        <span class="text-[9px] text-slate-500 font-mono">\${emp.last_updated ? new Date(emp.last_updated).toLocaleDateString() : '--/--'}</span>
+                    </div>
+                </div>
+            </div>\`;
+        }
+
+        // --- Modal & Chart Logic ---
+        function openHistoryModal(history, companyName) {
+            if (!history || history.length < 2) return;
+            const modal = document.getElementById('historyModal');
+            const title = document.getElementById('modalTitle');
+            const content = document.getElementById('modalContent');
+
+            title.innerText = \`Histórico de Sentimento: \${companyName}\`;
+            content.innerHTML = generateChartSVG(history);
+            modal.classList.remove('hidden');
+            lucide.createIcons();
+        }
+
+        function closeModal() {
+            document.getElementById('historyModal').classList.add('hidden');
+        }
+
+        function generateChartSVG(history) {
+            if (!history || history.length < 2) {
+                return \`<div class="text-center text-slate-500 py-10">Dados insuficientes para gerar gráfico (mínimo de 2 registros).</div>\`;
+            }
+            const W = 570, H = 250, PADDING = 40;
+            const points = history.map((p, i) => ({
+                x: PADDING + i * (W - 2 * PADDING) / (history.length - 1),
+                y: H - PADDING - (p.score / 10) * (H - 2 * PADDING),
+                score: p.score,
+                date: new Date(p.date)
+            }));
+
+            const pathD = "M" + points.map(p => \`\${p.x.toFixed(2)} \${p.y.toFixed(2)}\`).join(" L");
+
+            const circles = points.map(p => 
+                \`<g transform="translate(\${p.x}, \${p.y})">
+                    <circle cx="0" cy="0" r="8" fill="#6366f1" fill-opacity="0.2" />
+                    <circle cx="0" cy="0" r="4" fill="#a5b4fc" stroke="#0f172a" stroke-width="2" />
+                </g>\`
+            ).join('');
+
+            const xLabels = points.map((p, i) => {
+                if (history.length > 10 && i % 2 !== 0 && i !== history.length - 1 && i !== 0) return '';
+                const dateStr = p.date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+                return \`<text x="\${p.x}" y="\${H - PADDING + 20}" fill="#94a3b8" font-size="10" text-anchor="middle">\${dateStr}</text>\`;
+            }).join('');
+
+            const yLabels = [0, 2, 4, 6, 8, 10].map(score => {
+                const y = H - PADDING - (score / 10) * (H - 2 * PADDING);
+                return \`<text x="\${PADDING - 10}" y="\${y}" fill="#94a3b8" font-size="10" text-anchor="end" dominant-baseline="middle">\${score}</text>
+                        <line x1="\${PADDING}" y1="\${y}" x2="\${W - PADDING}" y2="\${y}" stroke="#334155" stroke-width="0.5" />\`;
+            }).join('');
+
+            return \`<svg width="100%" height="\${H}" viewBox="0 0 \${W} \${H}">
+                \${yLabels}
+                <path d="\${pathD}" fill="none" stroke="#6366f1" stroke-width="2" />
+                \${circles}
+                \${xLabels}
+            </svg>\`;
+        }
+        loadCompanies();
+    </script>
+</body>
+</html>
+`;              if(data.length === 0) { 
+                    grid.innerHTML = '<div class="col-span-full text-center text-slate-600 py-32 font-mono">NO ACTIVE CLIENTS.</div>'; 
+                    return; 
+                }
+                data.forEach(emp => {
+                    const sCli = (emp.status_cliente || 'Neutro').replace(/\s/g, '');
+                    const sProj = (emp.status_projeto || 'EmAnálise').replace(/\s/g, '');
+                    const contentHtml = emp.resumo && emp.resumo.includes('<div') 
+                        ? emp.resumo 
+                        : \`<div class="flex flex-col items-center justify-center h-40 text-slate-500 gap-2"><i data-lucide="ghost" class="w-6 h-6 opacity-30"></i><p class="text-xs">Sem inteligência gerada.</p></div>\`;
+                    grid.innerHTML += \`
+                    <div class="glass-card rounded-2xl flex flex-col h-full relative group company-card" data-status="\${emp.status_cliente || 'Neutro'}">
+                        <div class="p-5 pb-3 border-b border-white/5">
+                            <div class="flex justify-between items-start mb-3">
+                                <h2 class="font-bold text-white text-lg tracking-tight truncate w-10/12 group-hover:text-indigo-300 transition-colors" title="\${emp.nome}">\${emp.nome}</h2>
+                                \${emp.doc_link ? \`<a href="\${emp.doc_link}" target="_blank" class="text-slate-600 hover:text-white transition-colors p-1 hover:bg-white/10 rounded"><i data-lucide="file-text" class="w-4 h-4"></i></a>\` : ''}
+                            </div>
+                            <div class="flex gap-2">
+                                <span class="badge st-\${sCli}">\${emp.status_cliente || 'PENDENTE'}</span>
+                                <span class="badge st-\${sProj}">\${emp.status_projeto || '...'}</span>
+                            </div>
+                        </div>
+                        <div class="p-5 flex-grow text-sm">
+                            \${contentHtml}
+                        </div>
+                        <div class="p-4 mt-auto border-t border-white/5 bg-slate-900/30 rounded-b-2xl">
+                            <button onclick="summarize('\${emp.nome}', \${emp.id})" id="btn-\${emp.id}" 
+                                class="w-full bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5 group-hover:border-indigo-500/30">
+                                <i data-lucide="zap" class="w-3 h-3"></i> 
+                                \${emp.resumo ? 'REPROCESSAR DADOS' : 'INICIAR ANÁLISE'}
+                            </button>
+                            <div class="flex justify-between items-center mt-3 px-1">
+                                <span class="text-[9px] text-slate-600 uppercase font-bold tracking-wider">Last Sync</span>
+                                <span class="text-[9px] text-slate-500 font-mono">
+                                    \${emp.last_updated ? new Date(emp.last_updated).toLocaleDateString() : '--/--'}
+                                </span>
+                            </div>
+                        </div>
+                    </div>\`;
+                    grid.innerHTML += generateCardHTML(emp);
+                });
+                lucide.createIcons();
+            } catch (e) { 
+                grid.innerHTML = '<div class="col-span-full text-center text-red-400 font-mono py-20">SYSTEM FAILURE: API UNREACHABLE.</div>'; 
+            }
+        }
+        function filterGrid() {
+            const filter = document.getElementById('statusFilter').value;
+
+        function applyFilters() {
+            const statusFilter = document.getElementById('statusFilter').value;
+            const searchFilter = document.getElementById('searchFilter').value.toLowerCase();
+            const cards = document.querySelectorAll('.company-card');
+            cards.forEach(card => {
+                const status = card.getAttribute('data-status');
+                if (filter === 'all' || status === filter) card.style.display = 'flex';
+                else card.style.display = 'none';
+                const name = card.querySelector('h2').getAttribute('title').toLowerCase();
+                
+                const statusMatch = (statusFilter === 'all' || status === statusFilter);
+                const nameMatch = name.includes(searchFilter);
+
+                if (statusMatch && nameMatch) {
+                    card.style.display = 'flex';
+                } else {
+                    card.style.display = 'none';
+                }
+            });
+        }
+
         async function summarize(nome, id) {
             const btn = document.getElementById('btn-' + id);
             const originalHTML = btn.innerHTML;
             btn.disabled = true; 
             btn.className = "w-full bg-indigo-600/20 text-indigo-300 py-2.5 rounded-lg text-xs font-bold flex justify-center items-center gap-2 cursor-wait border border-indigo-500/30 animate-pulse";
             btn.innerHTML = '<i data-lucide="loader-2" class="animate-spin w-3 h-3"></i> EXTRAINDO INTELIGÊNCIA...';
+            const card = document.getElementById('card-' + id);
+            if (!card) return;
+
+            const loadingOverlay = document.createElement('div');
+            loadingOverlay.className = 'absolute inset-0 bg-slate-900/80 backdrop-blur-sm flex flex-col items-center justify-center z-10 rounded-2xl';
+            loadingOverlay.innerHTML = '<i data-lucide="loader-2" class="animate-spin w-8 h-8 text-indigo-400"></i><p class="mt-3 text-sm text-indigo-300 font-mono">PROCESSANDO...</p>';
+            card.appendChild(loadingOverlay);
             lucide.createIcons();
+
             try {
                 const res = await fetch(API_URL + '/api/resumir-empresa', {
                     method: 'POST',
@@ -794,9 +977,14 @@ const DASHBOARD_HTML = `
                 if (json.success) { 
                     loadCompanies(); 
                 } else { 
+                if (json.success) {
+                    card.outerHTML = generateCardHTML(json.data);
+                    lucide.createIcons();
+                } else {
                     alert('Erro: ' + (json.details || json.error)); 
                     btn.innerHTML = 'FALHA NA EXTRAÇÃO';
                     btn.className = "w-full bg-red-900/20 text-red-400 border border-red-500/30 py-2.5 rounded-lg text-xs font-bold";
+                    card.removeChild(loadingOverlay);
                 }
             } catch (e) { 
                 btn.innerHTML = 'ERRO DE CONEXÃO';
@@ -810,8 +998,11 @@ const DASHBOARD_HTML = `
                         lucide.createIcons();
                     }, 3000);
                 }
+                alert('Erro de conexão: ' + e.message);
+                if (card.contains(loadingOverlay)) card.removeChild(loadingOverlay);
             }
         }
+
         async function addCompany() {
             const input = document.getElementById('newCompanyInput');
             const nome = input.value.trim();
@@ -821,6 +1012,50 @@ const DASHBOARD_HTML = `
                 const json = await res.json();
                 if(json.success) { input.value = ''; loadCompanies(); }
             } catch(e) {}
+        }
+
+        function generateCardHTML(emp) {
+            const sCli = (emp.status_cliente || 'Neutro').replace(/\s/g, '');
+            const historyJson = JSON.stringify(emp.score_history || []);
+            const contentHtml = emp.resumo && emp.resumo.includes('<div') 
+                ? emp.resumo 
+                : \`<div class="flex flex-col items-center justify-center h-40 text-slate-500 gap-2"><i data-lucide="ghost" class="w-6 h-6 opacity-30"></i><p class="text-xs">Sem inteligência gerada.</p></div>\`;
+            const isUnlinked = !emp.doc_link;
+
+            return \`
+            <div id="card-\${emp.id}" class="glass-card rounded-2xl flex flex-col h-full relative group company-card \${isUnlinked ? 'is-unlinked' : ''}" data-status="\${emp.status_cliente || 'Neutro'}">
+                <div class="p-5 pb-3 border-b border-white/5">
+                    <div class="flex justify-between items-start mb-3">
+                        <h2 class="font-bold text-white text-lg tracking-tight truncate w-10/12 group-hover:text-indigo-300 transition-colors" title="\${emp.nome}">\${emp.nome}</h2>
+                        \${emp.doc_link ? \`<a href="\${emp.doc_link}" target="_blank" class="text-slate-600 hover:text-white transition-colors p-1 hover:bg-white/10 rounded"><i data-lucide="file-text" class="w-4 h-4"></i></a>\` : ''}
+                    </div>
+                    <div class="flex gap-2">
+                        <span class="badge st-\${sCli}">\${emp.status_cliente || 'PENDENTE'}</span>
+                    </div>
+                </div>
+                <div class="p-5 flex-grow text-sm">
+                    \${contentHtml}
+                </div>
+                <div class="p-4 mt-auto border-t border-white/5 bg-slate-900/30 rounded-b-2xl flex flex-col gap-3">
+                    <div class="flex gap-2">
+                        <button onclick="summarize('\${emp.nome.replace(/'/g, "\\\\'")}', \${emp.id})" id="btn-\${emp.id}" 
+                            class="flex-grow bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5 group-hover:border-indigo-500/30">
+                            <i data-lucide="zap" class="w-3 h-3"></i> 
+                            \${emp.resumo ? 'REPROCESSAR' : 'ANALISAR'}
+                        </button>
+                        <button 
+                            onclick='if(${(emp.score_history || []).length > 1}) openHistoryModal(${historyJson}, \`\${emp.nome.replace(/'/g, "\\\\'")}\`)'
+                            class="w-12 flex-shrink-0 flex items-center justify-center bg-slate-800 rounded-lg border border-white/5 \${(emp.score_history || []).length > 1 ? 'hover:bg-indigo-600 hover:border-indigo-500/30 cursor-pointer' : 'opacity-50 cursor-not-allowed'}"
+                            title="Ver Histórico de Score">
+                            <i data-lucide="bar-chart-3" class="w-4 h-4 text-slate-300"></i>
+                        </button>
+                    </div>
+                    <div class="flex justify-between items-center px-1">
+                        <span class="text-[9px] text-slate-600 uppercase font-bold tracking-wider">Last Sync</span>
+                        <span class="text-[9px] text-slate-500 font-mono">\${emp.last_updated ? new Date(emp.last_updated).toLocaleDateString() : '--/--'}</span>
+                    </div>
+                </div>
+            </div>\`;
         }
 
         // --- Modal & Chart Logic ---
