@@ -18,6 +18,7 @@ const supabase = createClient(
 
 const BASE_URL = 'https://api.headoffice.ai/v1';
 const SHEET_ID = '1m6yZozLKIZ8KyT9YW62qikkSZE-CrQsjTNTX6V9Y0eM';
+// CSV Export Link (Funciona se a planilha estiver "Qualquer um com o link")
 const SHEET_CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=0`;
 
 const BOT_ID = '69372353b11d9df606b68bf8';
@@ -41,7 +42,7 @@ function getHeadOfficeToken() {
     return rawToken.length > 10 ? rawToken : null;
 }
 
-// --- HELPER AUTH GOOGLE ---
+// --- HELPER AUTH GOOGLE (DOCS APENAS) ---
 function getGoogleAuth() {
     const privateKey = process.env.GOOGLE_PRIVATE_KEY 
         ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') 
@@ -56,9 +57,7 @@ function getGoogleAuth() {
             client_email: process.env.GOOGLE_CLIENT_EMAIL,
             private_key: privateKey,
         },
-        scopes: [
-            'https://www.googleapis.com/auth/documents.readonly'
-        ],
+        scopes: ['https://www.googleapis.com/auth/documents.readonly'],
     });
 }
 
@@ -160,25 +159,7 @@ function optimizeTextForGet(text) {
     }
 }
 
-// --- BUSCA PLANILHA (VIA CSV PÚBLICO) ---
-async function findDocLinkInSheet(companyName) {
-    try {
-        const response = await axios.get(SHEET_CSV_URL);
-        const rows = response.data.split(/\r?\n/);
-
-        for (const row of rows) {
-            if (row.toLowerCase().includes(companyName.toLowerCase())) {
-                const match = row.match(/https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+/);
-                if (match) return match[0];
-            }
-        }
-        return null;
-    } catch (error) {
-        throw new Error("Erro ao acessar Planilha (CSV): " + error.message);
-    }
-}
-
-// --- BUSCA ABAS DO DOC ---
+// --- BUSCA ABAS ---
 async function getAllTabsSorted(docId) {
     const auth = getGoogleAuth();
     const client = await auth.getClient();
@@ -213,16 +194,22 @@ async function getAllTabsSorted(docId) {
 async function generateCompanyIntelligence(nome, id, authHeader) {
     let docId = null;
     let docUrl = null;
-    let debugLogs = [];
-
-    // 1. Achar Link
+    
+    // 1. Achar Link (Via CSV)
     try {
-        docUrl = await findDocLinkInSheet(nome);
-        if (docUrl) {
-            const match = docUrl.match(/\/d\/([a-zA-Z0-9_-]+)/);
-            if (match) docId = match[1];
+        const csvResponse = await axios.get(SHEET_CSV_URL);
+        const lines = csvResponse.data.split('\n');
+        for (const line of lines) {
+            if (line.toLowerCase().includes(nome.toLowerCase())) {
+                const match = line.match(/\/d\/([a-zA-Z0-9_-]+)/);
+                if (match) { 
+                    docId = match[1];
+                    docUrl = `https://docs.google.com/document/d/${docId}`;
+                    break; 
+                }
+            }
         }
-    } catch (e) { throw new Error("Erro Planilha: " + e.message); }
+    } catch (e) { throw new Error("Erro ao ler CSV da planilha. Verifique se ela é pública."); }
 
     if (!docId) throw new Error(`Link não encontrado para ${nome}.`);
 
@@ -230,7 +217,7 @@ async function generateCompanyIntelligence(nome, id, authHeader) {
     let allTabs = await getAllTabsSorted(docId);
     if (allTabs.length === 0) throw new Error("Documento vazio.");
 
-    // 3. Processar (Cadeia)
+    // 3. Processar
     let currentMemory = "Início da análise.";
     
     for (let i = 0; i < allTabs.length; i++) {
@@ -242,10 +229,10 @@ async function generateCompanyIntelligence(nome, id, authHeader) {
         let contextForUrl = "";
 
         if (!isLast) {
-            prompt = `ATUE COMO CS MANAGER. REUNIÃO PASSADA: ${tab.title}. INSTRUÇÃO: Atualize a memória com o SENTIMENTO do cliente (ele reclamou? elogiou?). Seja conciso.`;
+            prompt = `ATUE COMO CS MANAGER. REUNIÃO PASSADA: ${tab.title}. INSTRUÇÃO: Atualize a memória com o SENTIMENTO do cliente (ele reclamou? elogiou? estava feliz?). Seja conciso.`;
             contextForUrl = `MEMÓRIA: ${currentMemory.slice(0, 500)}\n\nRESUMO: ${cleanContent}`;
         } else {
-            // PROMPT ATUALIZADO: Foco em HUMOR, não em TAREFAS
+            // --- PROMPT FINAL: Foco em EMOÇÃO, não TAREFAS ---
             prompt = `ATUE COMO DIRETOR DE CS. ÚLTIMA REUNIÃO (${tab.title}).
             
             --- MISSÃO FINAL ---
@@ -309,7 +296,7 @@ async function generateCompanyIntelligence(nome, id, authHeader) {
 
     const score = parseInt(data.sentimento_score) || 5;
     
-    // NOVA LÓGICA DE STATUS (5 NÍVEIS)
+    // NOVA LÓGICA DE 5 NÍVEIS
     let status_cliente = "Neutro";
     let scoreColor = "text-yellow-400 border-yellow-500/30 bg-yellow-500/10";
     
@@ -610,14 +597,6 @@ const DASHBOARD_HTML = `
             try {
                 const res = await fetch(API_URL + '/api/empresas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nome }) });
                 const json = await res.json();
-                if(json.success) { input.value = ''; loadCompanies(); }
-            } catch(e) {}
-        }
-        loadCompanies();
-    </script>
-</body>
-</html>
-`;              const json = await res.json();
                 if(json.success) { input.value = ''; loadCompanies(); }
             } catch(e) {}
         }
