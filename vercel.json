@@ -11,5 +11,11 @@
         { "key": "Access-Control-Allow-Methods", "value": "GET,POST,OPTIONS" }
       ]
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/daily-sync",
+      "schedule": "59 02 * * *"
+    }
   ]
 }
