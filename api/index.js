@@ -258,13 +258,20 @@ app.post('/api/empresas', async (req, res) => {
 // LÓGICA DE INTELIGÊNCIA (DIRECTOR MODE + SNIPER)
 // ======================================================
 
-async function processCompanyIntelligence(id, nome) {
+async function processCompanyIntelligence(id, nome, existingHistory = null) {
     const authHeader = getHeadOfficeToken();
     
     let docId = null;
     let docUrl = null;
 
     if (!authHeader) return { success: false, error: "Token HeadOffice inválido." };
+
+    let history = existingHistory;
+    if (history === null) {
+        // Se o histórico não foi passado (ex: chamada única), busca no DB
+        const { data: companyData } = await supabase.from('empresas').select('score_history').eq('id', id).single();
+        history = companyData?.score_history || [];
+    }
 
     try {
         // 1. LINK NO CSV
@@ -338,20 +345,26 @@ async function processCompanyIntelligence(id, nome) {
                 ${cleanContent}
                 
                 REGRAS RÍGIDAS PARA 'sentimento_score':
-                1. AVALIE ESTRITAMENTE O HUMOR E A EMOÇÃO DO CLIENTE com base no texto. IGNORE o progresso de tarefas ou cronogramas. O score reflete o SENTIMENTO do cliente, não o status do projeto.
-                2. Se o projeto está atrasado mas o cliente está calmo e colaborativo, a nota DEVE SER ALTA (7+). Se o projeto está em dia mas o cliente está irritado, a nota DEVE SER BAIXA (0-4).
-                3. Use a seguinte escala de pontuação:
-                   - 9-10 (Extremamente Satisfeito): Cliente apaixonado, promotor da marca, com elogios explícitos e entusiasmados ("excelente", "incrível", "muito bom").
-                   - 7-8 (Satisfeito): Cliente feliz, colaborativo, com tom positivo e construtivo. Satisfeito com o andamento geral.
-                   - 5-6 (Neutro): Cliente profissional, transacional, sem demonstrar emoções fortes (positivas ou negativas). Focado nos fatos.
-                   - 3-4 (Insatisfeito): Cliente demonstrou insatisfação pontual, frustração, criticou ou rejeitou entregas, fez reclamações leves.
-                   - 0-2 (Crítico): Cliente visivelmente irritado, hostil, grosso, ou mencionou riscos de cancelamento/crise.
-                4. 'proximos_passos' e 'checkpoints_feitos' devem ser extraídos SOMENTE do "TEXTO DA ÚLTIMA REUNIÃO". Se o texto citar Felipe, Barbara, William, use os nomes.
-                5. Nunca fabrique dados ou invente tarefas.
+                1. **PRINCÍPIO GUIA**: Comece com uma nota base de 7 (Satisfeito) para uma interação profissional e colaborativa. A nota só deve cair abaixo de 7 se houver sinais CLAROS de problemas.
+                2. **AVALIE O SENTIMENTO, NÃO O PROJETO**: O score reflete o HUMOR e a EMOÇÃO do cliente. Ignore o status de tarefas (atrasadas/em dia). Um cliente calmo e parceiro em um projeto com problemas deve ter nota ALTA (7+).
+                3. **QUANDO AUMENTAR A NOTA (8-10)**:
+                   - **Score 10 (Apaixonado)**: Elogios explícitos e repetidos ("incrível", "excelente", "adorando", "melhorou muito"). Cliente age como um promotor da marca.
+                   - **Score 8-9 (Feliz)**: Tom consistentemente positivo, proativo, construtivo. Demonstrações claras de contentamento com os resultados ou com a parceria.
+                4. **QUANDO MANTER A NOTA (7)**:
+                   - **Score 7 (Satisfeito)**: Cliente colaborativo, tom positivo, profissional. A reunião flui bem, sem atritos. Este é o padrão para um bom relacionamento.
+                5. **QUANDO DIMINUIR A NOTA (0-6)**:
+                   - **Score 5-6 (Neutro/Alerta)**: Cliente transacional, apático, monossilábico ou demonstra baixo engajamento/desinteresse. A conversa é estritamente profissional, sem cordialidade.
+                   - **Score 3-4 (Insatisfeito)**: Sinais de preocupação, frustração, reclamações leves, rejeição de entregas, ou atritos na conversa.
+                   - **Score 0-2 (Crítico)**: Cliente irritado, hostil, usando linguagem grosseira, ou mencionando diretamente riscos de cancelamento/crise.
+                6. **EXTRAÇÃO DE DADOS**: 'proximos_passos' e 'checkpoints_feitos' devem ser extraídos SOMENTE do "TEXTO DA ÚLTIMA REUNIÃO". Se o texto citar Felipe, Barbara, William, use os nomes. Nunca invente dados.
+                7. **ANÁLISE DE TEMPERATURA**: Compare o sentimento da "ÚLTIMA REUNIÃO" com o "Histórico Prévio".
+                   - "aquecendo": O sentimento melhorou significativamente ou o cliente está notavelmente mais positivo.
+                   - "estável": O sentimento se manteve consistente (seja positivo, neutro ou negativo).
+                   - "esfriando": O sentimento piorou, surgiram novas preocupações, atritos ou desinteresse.
         
                 FORMATO DE RESPOSTA:
                 JSON ESTRITO (Responda APENAS o JSON):
-                {"resumo_executivo": "...", "perfil_cliente": "...", "estrategia_relacionamento": "...", "checkpoints_feitos": [], "proximos_passos": [], "riscos_bloqueios": "...", "sentimento_score": "0-10"}`;
+                {"resumo_executivo": "...", "perfil_cliente": "...", "estrategia_relacionamento": "...", "checkpoints_feitos": [], "proximos_passos": [], "riscos_bloqueios": "...", "sentimento_score": "0-10", "temperatura_geral": "aquecendo|estável|esfriando"}`;
             }
 
             // CHAMADA GET (Safe)
@@ -405,6 +418,10 @@ async function processCompanyIntelligence(id, nome) {
             data = { resumo_executivo: "Erro ao processar JSON. Logs: " + currentMemory.substring(0, 300) };
         }
 
+        // Atualiza histórico de score
+        history.push({ score: parseInt(data.sentimento_score, 10) || 5, date: new Date().toISOString() });
+        const updatedHistory = history.slice(-12); // Mantém os últimos 12 registros
+
         const score = parseInt(data.sentimento_score, 10) || 5; // Default to Neutro
         let scoreColor, statusCliente;
 
@@ -426,6 +443,29 @@ async function processCompanyIntelligence(id, nome) {
         }
 
         const lastTabName = allTabs.length > 0 ? allTabs[allTabs.length-1].title : "Geral";
+
+        const temperatura = data.temperatura_geral;
+        let temperaturaHtml = '';
+        if (temperatura) {
+            let tempIcon = 'minus';
+            let tempColor = 'text-yellow-400';
+            let tempText = temperatura;
+
+            if (temperatura === 'aquecendo') { 
+                tempIcon = 'trending-up'; 
+                tempColor = 'text-emerald-400'; 
+            }
+            if (temperatura === 'esfriando') { 
+                tempIcon = 'trending-down'; 
+                tempColor = 'text-red-400'; 
+            }
+
+            temperaturaHtml = `
+                <div class="flex-1 bg-slate-800/50 border-white/5 border p-2 rounded flex flex-col justify-center items-center">
+                    <span class="text-[9px] uppercase font-bold text-slate-500 block mb-1">Temperatura</span>
+                    <div class="flex items-center gap-1.5 ${tempColor}"><i data-lucide="${tempIcon}" class="w-3 h-3"></i><span class="text-[10px] font-bold uppercase">${tempText}</span></div>
+                </div>`;
+        }
 
         const htmlResumo = `
             <div class="space-y-4 font-sans">
@@ -479,6 +519,7 @@ async function processCompanyIntelligence(id, nome) {
                         <span class="text-[9px] uppercase font-bold text-slate-500 block mb-1">Riscos</span>
                         <p class="text-[10px] text-slate-400 leading-tight">${data.riscos_bloqueios || "Nenhum."}</p>
                     </div>
+                    ${temperaturaHtml}
                     <div class="w-16 flex flex-col items-center justify-center p-1 rounded border ${scoreColor}">
                         <span class="text-[8px] uppercase font-bold opacity-70">Score</span>
                         <span class="text-xl font-bold">${score}</span>
@@ -492,9 +533,8 @@ async function processCompanyIntelligence(id, nome) {
             doc_link: docUrl,
             resumo: htmlResumo,
             pontos_importantes: "Ver card",
+            score_history: updatedHistory,
             status_cliente: statusCliente,
-            status_projeto: data.status_projeto || "Em Análise",
-            // status_projeto removido para evitar alucinação e poluição visual
             last_updated: new Date()
         };
 
@@ -510,7 +550,7 @@ async function processCompanyIntelligence(id, nome) {
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     const result = await processCompanyIntelligence(id, nome);
-    if (!result.success) {
+    if (!result || !result.success) {
         return res.status(500).json(result);
     }
     res.json(result);
@@ -525,7 +565,7 @@ app.get('/api/cron/daily-update', async (req, res) => {
 
         const results = [];
         for (const company of companies) {
-            const result = await processCompanyIntelligence(company.id, company.nome);
+            const result = await processCompanyIntelligence(company.id, company.nome, company.score_history);
             results.push({ company: company.nome, success: result.success });
         }
         res.json({ status: "Ciclo diário concluído", details: results });
@@ -570,11 +610,17 @@ const DASHBOARD_HTML = `
         .st-Neutro { background: rgba(234, 179, 8, 0.1); color: #facc15; border-color: rgba(234, 179, 8, 0.3); }
         .st-Insatisfeito { background: rgba(249, 115, 22, 0.1); color: #fb923c; border-color: rgba(249, 115, 22, 0.3); }
         .st-Crítico { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border-color: rgba(239, 68, 68, 0.3); }
-        /* Status Projeto (Exemplos) */
-        .st-EmDia { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
-        .st-EmAnálise { background: rgba(148, 163, 184, 0.15); color: #e2e8f0; border-color: rgba(148, 163, 184, 0.3); }
-        .st-Atrasado, .st-Risco { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border-color: rgba(239, 68, 68, 0.3); }
         .bg-grid { background-image: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px); background-size: 30px 30px; }
+        .is-unlinked {
+            opacity: 0.6;
+            filter: grayscale(60%);
+            transition: all 0.4s ease-in-out;
+        }
+        .is-unlinked:hover {
+            opacity: 1;
+            filter: grayscale(0%);
+            transform: translateY(-4px);
+        }
     </style>
 </head>
 <body class="min-h-screen bg-grid">
@@ -591,9 +637,14 @@ const DASHBOARD_HTML = `
                     <p class="text-slate-400 text-xs font-medium tracking-wide">REAL-TIME INTELLIGENCE FEED</p>
                 </div>
             </div>
-            <div class="flex items-center gap-3 w-full md:w-auto">
+            <div class="flex items-center gap-3 w-full md:w-auto flex-wrap justify-end">
                 <div class="relative">
-                    <select id="statusFilter" onchange="filterGrid()" class="bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 block p-2.5 pr-8 appearance-none cursor-pointer">
+                    <input type="text" id="searchFilter" oninput="applyFilters()" placeholder="Buscar empresa..." 
+                        class="w-56 bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 block p-2.5 pl-10 transition-all">
+                    <i data-lucide="search" class="absolute left-3 top-3 w-4 h-4 text-slate-500 pointer-events-none"></i>
+                </div>
+                <div class="relative">
+                    <select id="statusFilter" onchange="applyFilters()" class="bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 block p-2.5 pr-8 appearance-none cursor-pointer">
                         <option value="all">Todos</option>
                         <option value="Extremamente Satisfeito">Extremamente Satisfeitos</option>
                         <option value="Satisfeito">Satisfeitos</option>
@@ -605,7 +656,7 @@ const DASHBOARD_HTML = `
                 </div>
                 <div class="relative group">
                     <input type="text" id="newCompanyInput" placeholder="Nova Empresa..." 
-                        class="w-64 bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 block p-2.5 pl-10 transition-all">
+                        class="w-56 bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 block p-2.5 pl-10 transition-all">
                     <i data-lucide="plus-circle" class="absolute left-3 top-3 w-4 h-4 text-slate-500"></i>
                 </div>
                 <button onclick="addCompany()" class="bg-white hover:bg-slate-200 text-slate-900 px-5 py-2.5 rounded-lg text-sm font-bold transition-all shadow-lg hover:shadow-xl flex items-center gap-2">
@@ -614,6 +665,19 @@ const DASHBOARD_HTML = `
             </div>
         </header>
         <div id="grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-6 pb-20"></div>
+
+        <!-- Modal de Histórico -->
+        <div id="historyModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-[100] hidden" onclick="closeModal()">
+            <div class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-2xl shadow-2xl shadow-indigo-500/10" onclick="event.stopPropagation()">
+                <div class="p-5 border-b border-slate-800 flex justify-between items-center">
+                    <h3 id="modalTitle" class="text-lg font-bold text-white">Histórico de Sentimento</h3>
+                    <button onclick="closeModal()" class="text-slate-500 hover:text-white p-2 -mr-2 rounded-full transition-colors"><i data-lucide="x" class="w-5 h-5"></i></button>
+                </div>
+                <div id="modalContent" class="p-6 bg-slate-900/50 rounded-b-2xl">
+                    <!-- Chart will be injected here -->
+                </div>
+            </div>
+        </div>
     </div>
     <script>
         lucide.createIcons();
@@ -631,7 +695,7 @@ const DASHBOARD_HTML = `
                 }
                 data.forEach(emp => {
                     const sCli = (emp.status_cliente || 'Neutro').replace(/\s/g, '');
-                    const sProj = (emp.status_projeto || 'EmAnálise').replace(/\s/g, '');
+                    const historyJson = JSON.stringify(emp.score_history || []);
                     const contentHtml = emp.resumo && emp.resumo.includes('<div') 
                         ? emp.resumo 
                         : \`<div class="flex flex-col items-center justify-center h-40 text-slate-500 gap-2"><i data-lucide="ghost" class="w-6 h-6 opacity-30"></i><p class="text-xs">Sem inteligência gerada.</p></div>\`;
@@ -644,19 +708,26 @@ const DASHBOARD_HTML = `
                             </div>
                             <div class="flex gap-2">
                                 <span class="badge st-\${sCli}">\${emp.status_cliente || 'PENDENTE'}</span>
-                                <span class="badge st-\${sProj}">\${emp.status_projeto || '...'}</span>
                             </div>
                         </div>
                         <div class="p-5 flex-grow text-sm">
                             \${contentHtml}
                         </div>
-                        <div class="p-4 mt-auto border-t border-white/5 bg-slate-900/30 rounded-b-2xl">
-                            <button onclick="summarize('\${emp.nome}', \${emp.id})" id="btn-\${emp.id}" 
-                                class="w-full bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5 group-hover:border-indigo-500/30">
-                                <i data-lucide="zap" class="w-3 h-3"></i> 
-                                \${emp.resumo ? 'REPROCESSAR DADOS' : 'INICIAR ANÁLISE'}
-                            </button>
-                            <div class="flex justify-between items-center mt-3 px-1">
+                        <div class="p-4 mt-auto border-t border-white/5 bg-slate-900/30 rounded-b-2xl flex flex-col gap-3">
+                            <div class="flex gap-2">
+                                <button onclick="summarize('\${emp.nome.replace(/'/g, "\\\\'")}', \${emp.id})" id="btn-\${emp.id}" 
+                                    class="flex-grow bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5 group-hover:border-indigo-500/30">
+                                    <i data-lucide="zap" class="w-3 h-3"></i> 
+                                    \${emp.resumo ? 'REPROCESSAR' : 'ANALISAR'}
+                                </button>
+                                <button 
+                                    onclick='if((emp.score_history || []).length > 1) openHistoryModal(${historyJson}, \`\${emp.nome.replace(/'/g, "\\\\'")}\`)'
+                                    class="w-12 flex-shrink-0 flex items-center justify-center bg-slate-800 rounded-lg border border-white/5 \${(emp.score_history || []).length > 1 ? 'hover:bg-indigo-600 hover:border-indigo-500/30 cursor-pointer' : 'opacity-50 cursor-not-allowed'}"
+                                    title="Ver Histórico de Score">
+                                    <i data-lucide="bar-chart-3" class="w-4 h-4 text-slate-300"></i>
+                                </button>
+                            </div>
+                            <div class="flex justify-between items-center px-1">
                                 <span class="text-[9px] text-slate-600 uppercase font-bold tracking-wider">Last Sync</span>
                                 <span class="text-[9px] text-slate-500 font-mono">
                                     \${emp.last_updated ? new Date(emp.last_updated).toLocaleDateString() : '--/--'}
@@ -670,13 +741,22 @@ const DASHBOARD_HTML = `
                 grid.innerHTML = '<div class="col-span-full text-center text-red-400 font-mono py-20">SYSTEM FAILURE: API UNREACHABLE.</div>'; 
             }
         }
-        function filterGrid() {
-            const filter = document.getElementById('statusFilter').value;
+        function applyFilters() {
+            const statusFilter = document.getElementById('statusFilter').value;
+            const searchFilter = document.getElementById('searchFilter').value.toLowerCase();
             const cards = document.querySelectorAll('.company-card');
             cards.forEach(card => {
                 const status = card.getAttribute('data-status');
-                if (filter === 'all' || status === filter) card.style.display = 'flex';
-                else card.style.display = 'none';
+                const name = card.querySelector('h2').getAttribute('title').toLowerCase();
+                
+                const statusMatch = (statusFilter === 'all' || status === statusFilter);
+                const nameMatch = name.includes(searchFilter);
+
+                if (statusMatch && nameMatch) {
+                    card.style.display = 'flex';
+                } else {
+                    card.style.display = 'none';
+                }
             });
         }
         async function summarize(nome, id) {
@@ -723,6 +803,64 @@ const DASHBOARD_HTML = `
                 const json = await res.json();
                 if(json.success) { input.value = ''; loadCompanies(); }
             } catch(e) {}
+        }
+
+        // --- Modal & Chart Logic ---
+        function openHistoryModal(history, companyName) {
+            if (!history || history.length < 2) return;
+            const modal = document.getElementById('historyModal');
+            const title = document.getElementById('modalTitle');
+            const content = document.getElementById('modalContent');
+
+            title.innerText = \`Histórico de Sentimento: \${companyName}\`;
+            content.innerHTML = generateChartSVG(history);
+            modal.classList.remove('hidden');
+            lucide.createIcons();
+        }
+
+        function closeModal() {
+            document.getElementById('historyModal').classList.add('hidden');
+        }
+
+        function generateChartSVG(history) {
+            if (!history || history.length < 2) {
+                return \`<div class="text-center text-slate-500 py-10">Dados insuficientes para gerar gráfico (mínimo de 2 registros).</div>\`;
+            }
+            const W = 570, H = 250, PADDING = 40;
+            const points = history.map((p, i) => ({
+                x: PADDING + i * (W - 2 * PADDING) / (history.length - 1),
+                y: H - PADDING - (p.score / 10) * (H - 2 * PADDING),
+                score: p.score,
+                date: new Date(p.date)
+            }));
+
+            const pathD = "M" + points.map(p => \`\${p.x.toFixed(2)} \${p.y.toFixed(2)}\`).join(" L");
+
+            const circles = points.map(p => 
+                \`<g transform="translate(\${p.x}, \${p.y})">
+                    <circle cx="0" cy="0" r="8" fill="#6366f1" fill-opacity="0.2" />
+                    <circle cx="0" cy="0" r="4" fill="#a5b4fc" stroke="#0f172a" stroke-width="2" />
+                </g>\`
+            ).join('');
+
+            const xLabels = points.map((p, i) => {
+                if (history.length > 10 && i % 2 !== 0 && i !== history.length - 1 && i !== 0) return '';
+                const dateStr = p.date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+                return \`<text x="\${p.x}" y="\${H - PADDING + 20}" fill="#94a3b8" font-size="10" text-anchor="middle">\${dateStr}</text>\`;
+            }).join('');
+
+            const yLabels = [0, 2, 4, 6, 8, 10].map(score => {
+                const y = H - PADDING - (score / 10) * (H - 2 * PADDING);
+                return \`<text x="\${PADDING - 10}" y="\${y}" fill="#94a3b8" font-size="10" text-anchor="end" dominant-baseline="middle">\${score}</text>
+                        <line x1="\${PADDING}" y1="\${y}" x2="\${W - PADDING}" y2="\${y}" stroke="#334155" stroke-width="0.5" />\`;
+            }).join('');
+
+            return \`<svg width="100%" height="\${H}" viewBox="0 0 \${W} \${H}">
+                \${yLabels}
+                <path d="\${pathD}" fill="none" stroke="#6366f1" stroke-width="2" />
+                \${circles}
+                \${xLabels}
+            </svg>\`;
         }
         loadCompanies();
     </script>
