@@ -25,10 +25,11 @@ const BOT_NAME = 'Roger';
 
 // --- ROTA DASHBOARD ---
 app.get('/', (req, res) => {
-    const currentUrl = `https://${req.headers.host}`;
-    const htmlComUrl = DASHBOARD_HTML.replace('https://head-office-one.vercel.app', currentUrl);
-    res.send(htmlComUrl);
-    res.send(DASHBOARD_HTML);
+    // Vercel provides the HOST header. We'll use it to construct the dynamic API URL.
+    const apiUrl = `https://${req.headers.host}`;
+    // Replace the placeholder in the HTML with the actual URL.
+    const dynamicHtml = DASHBOARD_HTML.replace(new RegExp('https://head-office-one.vercel.app', 'g'), apiUrl);
+    res.send(dynamicHtml);
 });
 
 // --- HELPER AUTH ---
@@ -456,12 +457,11 @@ const DASHBOARD_HTML = `
             lucide.createIcons();
             try {
                 const res = await fetch(API_URL + '/api/empresas');
-                const res = await fetch('/api/empresas');
                 const data = await res.json();
                 grid.innerHTML = '';
                 if(data.length === 0) { grid.innerHTML = '<div class="col-span-full text-center text-slate-600 py-32 font-mono">NO ACTIVE CLIENTS.</div>'; return; }
                 data.forEach(emp => {
-                    const sCli = (emp.status_cliente || 'Neutro').replace(/\\s/g, '');
+                    const sCli = (emp.status_cliente || 'Neutro').replace(/\s/g, '');
                     const historyJson = JSON.stringify(emp.score_history || []);
                     const contentHtml = emp.resumo && emp.resumo.includes('<div') ? emp.resumo : \`<div class="flex flex-col items-center justify-center h-40 text-slate-500 gap-2"><i data-lucide="ghost" class="w-6 h-6 opacity-30"></i><p class="text-xs">Sem inteligência gerada.</p></div>\`;
                     const cardClass = emp.doc_link ? 'glass-card' : 'glass-card is-unlinked bg-slate-950/40 border-slate-800';
@@ -476,8 +476,8 @@ const DASHBOARD_HTML = `
                         <div class="p-5 flex-grow text-sm">\${contentHtml}</div>
                         <div class="p-4 mt-auto border-t border-white/5 bg-slate-900/30 rounded-b-2xl flex flex-col gap-3">
                             <div class="flex gap-2">
-                                <button onclick="summarize('\${emp.nome.replace(/'/g, "\\\\'")}', \${emp.id})" id="btn-\${emp.id}" class="flex-grow bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5 group-hover:border-indigo-500/30"><i data-lucide="zap" class="w-3 h-3"></i> \${emp.resumo ? 'REPROCESSAR' : 'ANALISAR'}</button>
-                                <button onclick='if((emp.score_history || []).length > 1) openHistoryModal(\${historyJson}, \`\${emp.nome.replace(/'/g, "\\\\'")}\`)' class="w-12 flex-shrink-0 flex items-center justify-center bg-slate-800 rounded-lg border border-white/5 \${(emp.score_history || []).length > 1 ? 'hover:bg-indigo-600 hover:border-indigo-500/30 cursor-pointer' : 'opacity-50 cursor-not-allowed'}" title="Ver Histórico de Score"><i data-lucide="bar-chart-3" class="w-4 h-4 text-slate-300"></i></button>
+                                <button onclick='summarize(\${JSON.stringify(emp.nome)}, \${emp.id})' id="btn-\${emp.id}" class="flex-grow bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5 group-hover:border-indigo-500/30"><i data-lucide="zap" class="w-3 h-3"></i> \${emp.resumo ? 'REPROCESSAR' : 'ANALISAR'}</button>
+                                <button onclick='if(${(emp.score_history || []).length > 1}) openHistoryModal(\${historyJson}, \${JSON.stringify(emp.nome)})' class="w-12 flex-shrink-0 flex items-center justify-center bg-slate-800 rounded-lg border border-white/5 \${(emp.score_history || []).length > 1 ? 'hover:bg-indigo-600 hover:border-indigo-500/30 cursor-pointer' : 'opacity-50 cursor-not-allowed'}" title="Ver Histórico de Score"><i data-lucide="bar-chart-3" class="w-4 h-4 text-slate-300"></i></button>
                             </div>
                             <div class="flex justify-between items-center px-1"><span class="text-[9px] text-slate-600 uppercase font-bold tracking-wider">Last Sync</span><span class="text-[9px] text-slate-500 font-mono">\${emp.last_updated ? new Date(emp.last_updated).toLocaleDateString() : '--/--'}</span></div>
                         </div>
@@ -522,7 +522,6 @@ const DASHBOARD_HTML = `
             
             try {
                 const res = await fetch(API_URL + '/api/resumir-empresa', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nome, id }) });
-                const res = await fetch('/api/resumir-empresa', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nome, id }) });
                 const json = await res.json();
                 if (json.success) { loadCompanies(); } else { throw new Error(json.details || json.error); }
             } catch (e) { 
@@ -542,16 +541,15 @@ const DASHBOARD_HTML = `
         async function addCompany() {
             const input = document.getElementById('newCompanyInput');
             const nome = input.value.trim();
-            if(!nome) return;
-            try { const res = await fetch(API_URL + '/api/empresas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nome }) }); const json = await res.json(); if(json.success) { input.value = ''; loadCompanies(); } } catch(e) {}
             if(!nome) {
                 alert('Por favor, insira um nome para a empresa.');
                 return;
             }
             try {
-                const res = await fetch('/api/empresas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nome }) });
+                const res = await fetch(API_URL + '/api/empresas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nome }) });
+                if (!res.ok) throw new Error(\`Falha na rede: \${res.status}\`);
                 const json = await res.json();
-                if (res.ok && json.success) {
+                if (json.success) {
                     input.value = '';
                     loadCompanies();
                 } else {
