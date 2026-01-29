@@ -266,13 +266,6 @@ async function processCompanyIntelligence(id, nome) {
 
     if (!authHeader) return { success: false, error: "Token HeadOffice inválido." };
 
-    let history = [];
-    try {
-        const { data: companyData, error: historyError } = await supabase.from('empresas').select('score_history').eq('id', id).single();
-        if (historyError) throw new Error(`Falha ao buscar histórico do Supabase: ${historyError.message}`);
-        history = companyData?.score_history || [];
-    } catch (e) { console.warn(`Erro ao buscar histórico para ${nome}: ${e.message}`); }
-
     try {
         // 1. LINK NO CSV
         try {
@@ -345,26 +338,20 @@ async function processCompanyIntelligence(id, nome) {
                 ${cleanContent}
                 
                 REGRAS RÍGIDAS PARA 'sentimento_score':
-                1. **PRINCÍPIO GUIA**: Comece com uma nota base de 7 (Satisfeito) para uma interação profissional e colaborativa. A nota só deve cair abaixo de 7 se houver sinais CLAROS de problemas.
-                2. **AVALIE O SENTIMENTO, NÃO O PROJETO**: O score reflete o HUMOR e a EMOÇÃO do cliente. Ignore o status de tarefas (atrasadas/em dia). Um cliente calmo e parceiro em um projeto com problemas deve ter nota ALTA (7+).
-                3. **QUANDO AUMENTAR A NOTA (8-10)**:
-                   - **Score 10 (Apaixonado)**: Elogios explícitos e repetidos ("incrível", "excelente", "adorando", "melhorou muito"). Cliente age como um promotor da marca.
-                   - **Score 8-9 (Feliz)**: Tom consistentemente positivo, proativo, construtivo. Demonstrações claras de contentamento com os resultados ou com a parceria.
-                4. **QUANDO MANTER A NOTA (7)**:
-                   - **Score 7 (Satisfeito)**: Cliente colaborativo, tom positivo, profissional. A reunião flui bem, sem atritos. Este é o padrão para um bom relacionamento.
-                5. **QUANDO DIMINUIR A NOTA (0-6)**:
-                   - **Score 5-6 (Neutro/Alerta)**: Cliente transacional, apático, monossilábico ou demonstra baixo engajamento/desinteresse. A conversa é estritamente profissional, sem cordialidade.
-                   - **Score 3-4 (Insatisfeito)**: Sinais de preocupação, frustração, reclamações leves, rejeição de entregas, ou atritos na conversa.
-                   - **Score 0-2 (Crítico)**: Cliente irritado, hostil, usando linguagem grosseira, ou mencionando diretamente riscos de cancelamento/crise.
-                6. **EXTRAÇÃO DE DADOS**: 'proximos_passos' e 'checkpoints_feitos' devem ser extraídos SOMENTE do "TEXTO DA ÚLTIMA REUNIÃO". Se o texto citar Felipe, Barbara, William, use os nomes. Nunca invente dados.
-                7. **ANÁLISE DE TEMPERATURA**: Compare o sentimento da "ÚLTIMA REUNIÃO" com o "Histórico Prévio".
-                   - "aquecendo": O sentimento melhorou significativamente ou o cliente está notavelmente mais positivo.
-                   - "estável": O sentimento se manteve consistente (seja positivo, neutro ou negativo).
-                   - "esfriando": O sentimento piorou, surgiram novas preocupações, atritos ou desinteresse.
+                1. AVALIE ESTRITAMENTE O HUMOR E A EMOÇÃO DO CLIENTE com base no texto. IGNORE o progresso de tarefas ou cronogramas. O score reflete o SENTIMENTO do cliente, não o status do projeto.
+                2. Se o projeto está atrasado mas o cliente está calmo e colaborativo, a nota DEVE SER ALTA (7+). Se o projeto está em dia mas o cliente está irritado, a nota DEVE SER BAIXA (0-4).
+                3. Use a seguinte escala de pontuação:
+                   - 9-10 (Extremamente Satisfeito): Cliente apaixonado, promotor da marca, com elogios explícitos e entusiasmados ("excelente", "incrível", "muito bom").
+                   - 7-8 (Satisfeito): Cliente feliz, colaborativo, com tom positivo e construtivo. Satisfeito com o andamento geral.
+                   - 5-6 (Neutro): Cliente profissional, transacional, sem demonstrar emoções fortes (positivas ou negativas). Focado nos fatos.
+                   - 3-4 (Insatisfeito): Cliente demonstrou insatisfação pontual, frustração, criticou ou rejeitou entregas, fez reclamações leves.
+                   - 0-2 (Crítico): Cliente visivelmente irritado, hostil, grosso, ou mencionou riscos de cancelamento/crise.
+                4. 'proximos_passos' e 'checkpoints_feitos' devem ser extraídos SOMENTE do "TEXTO DA ÚLTIMA REUNIÃO". Se o texto citar Felipe, Barbara, William, use os nomes.
+                5. Nunca fabrique dados ou invente tarefas.
         
                 FORMATO DE RESPOSTA:
                 JSON ESTRITO (Responda APENAS o JSON):
-                {"resumo_executivo": "...", "perfil_cliente": "...", "estrategia_relacionamento": "...", "checkpoints_feitos": [], "proximos_passos": [], "riscos_bloqueios": "...", "sentimento_score": "0-10", "temperatura_geral": "aquecendo|estável|esfriando"}`;
+                {"resumo_executivo": "...", "perfil_cliente": "...", "estrategia_relacionamento": "...", "checkpoints_feitos": [], "proximos_passos": [], "riscos_bloqueios": "...", "sentimento_score": "0-10"}`;
             }
 
             // CHAMADA GET (Safe)
@@ -418,10 +405,6 @@ async function processCompanyIntelligence(id, nome) {
             data = { resumo_executivo: "Erro ao processar JSON. Logs: " + currentMemory.substring(0, 300) };
         }
 
-        // Atualiza histórico de score
-        history.push({ score: parseInt(data.sentimento_score, 10) || 5, date: new Date().toISOString() });
-        const updatedHistory = history.slice(-12); // Mantém os últimos 12 registros
-
         const score = parseInt(data.sentimento_score, 10) || 5; // Default to Neutro
         let scoreColor, statusCliente;
 
@@ -443,29 +426,6 @@ async function processCompanyIntelligence(id, nome) {
         }
 
         const lastTabName = allTabs.length > 0 ? allTabs[allTabs.length-1].title : "Geral";
-
-        const temperatura = data.temperatura_geral;
-        let temperaturaHtml = '';
-        if (temperatura) {
-            let tempIcon = 'minus';
-            let tempColor = 'text-yellow-400';
-            let tempText = temperatura;
-
-            if (temperatura === 'aquecendo') { 
-                tempIcon = 'trending-up'; 
-                tempColor = 'text-emerald-400'; 
-            }
-            if (temperatura === 'esfriando') { 
-                tempIcon = 'trending-down'; 
-                tempColor = 'text-red-400'; 
-            }
-
-            temperaturaHtml = `
-                <div class="flex-1 bg-slate-800/50 border-white/5 border p-2 rounded flex flex-col justify-center items-center">
-                    <span class="text-[9px] uppercase font-bold text-slate-500 block mb-1">Temperatura</span>
-                    <div class="flex items-center gap-1.5 ${tempColor}"><i data-lucide="${tempIcon}" class="w-3 h-3"></i><span class="text-[10px] font-bold uppercase">${tempText}</span></div>
-                </div>`;
-        }
 
         const htmlResumo = `
             <div class="space-y-4 font-sans">
@@ -519,7 +479,6 @@ async function processCompanyIntelligence(id, nome) {
                         <span class="text-[9px] uppercase font-bold text-slate-500 block mb-1">Riscos</span>
                         <p class="text-[10px] text-slate-400 leading-tight">${data.riscos_bloqueios || "Nenhum."}</p>
                     </div>
-                    ${temperaturaHtml}
                     <div class="w-16 flex flex-col items-center justify-center p-1 rounded border ${scoreColor}">
                         <span class="text-[8px] uppercase font-bold opacity-70">Score</span>
                         <span class="text-xl font-bold">${score}</span>
@@ -529,23 +488,18 @@ async function processCompanyIntelligence(id, nome) {
             </div>
         `;
 
-        const updatePayloadForDB = {
+        const updatePayload = {
             doc_link: docUrl,
             resumo: htmlResumo,
             pontos_importantes: "Ver card",
             status_cliente: statusCliente,
-            score_history: updatedHistory,
+            status_projeto: data.status_projeto || "Em Análise",
+            // status_projeto removido para evitar alucinação e poluição visual
             last_updated: new Date()
         };
 
-        await supabase.from('empresas').update(updatePayloadForDB).eq('id', id);
-        
-        const returnPayload = {
-            ...updatePayloadForDB,
-            id: id,
-            nome: nome
-        };
-        return { success: true, data: returnPayload };
+        await supabase.from('empresas').update(updatePayload).eq('id', id);
+        return { success: true, data: updatePayload };
 
     } catch (error) {
         console.error(`[ERRO FATAL] para ${nome}:`, error.message);
@@ -555,16 +509,11 @@ async function processCompanyIntelligence(id, nome) {
 
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
-    try {
-        const result = await processCompanyIntelligence(id, nome);
-        if (!result || !result.success) {
-            return res.status(500).json(result);
-        }
-        res.json(result);
-    } catch (error) {
-        console.error(`[CRASH] em /api/resumir-empresa: ${error.message}`);
-        res.status(500).json({ error: "Erro inesperado no servidor.", details: error.message });
+    const result = await processCompanyIntelligence(id, nome);
+    if (!result.success) {
+        return res.status(500).json(result);
     }
+    res.json(result);
 });
 
 // --- ROTA CRON (ATUALIZAÇÃO DIÁRIA) ---
@@ -576,7 +525,7 @@ app.get('/api/cron/daily-update', async (req, res) => {
 
         const results = [];
         for (const company of companies) {
-            const result = await processCompanyIntelligence(company.id, company.nome, company.score_history);
+            const result = await processCompanyIntelligence(company.id, company.nome);
             results.push({ company: company.nome, success: result.success });
         }
         res.json({ status: "Ciclo diário concluído", details: results });
@@ -615,16 +564,6 @@ const DASHBOARD_HTML = `
         .glass-card { background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3); transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
         .glass-card:hover { border-color: rgba(99, 102, 241, 0.4); transform: translateY(-4px); box-shadow: 0 20px 40px -10px rgba(99, 102, 241, 0.15); background: rgba(30, 41, 59, 0.7); }
         .badge { padding: 4px 10px; border-radius: 99px; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid; box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
-        .is-unlinked {
-            opacity: 0.6;
-            filter: grayscale(60%);
-            transition: all 0.4s ease-in-out;
-        }
-        .is-unlinked:hover {
-            opacity: 1;
-            filter: grayscale(0%);
-            transform: translateY(-4px);
-        }
         /* Status Cliente */
         .st-ExtremamenteSatisfeito { background: rgba(6, 182, 212, 0.1); color: #22d3ee; border-color: rgba(6, 182, 212, 0.3); }
         .st-Satisfeito { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
@@ -652,14 +591,9 @@ const DASHBOARD_HTML = `
                     <p class="text-slate-400 text-xs font-medium tracking-wide">REAL-TIME INTELLIGENCE FEED</p>
                 </div>
             </div>
-            <div class="flex items-center gap-3 w-full md:w-auto flex-wrap justify-end">
+            <div class="flex items-center gap-3 w-full md:w-auto">
                 <div class="relative">
-                    <input type="text" id="searchFilter" oninput="applyFilters()" placeholder="Buscar empresa..." 
-                        class="w-56 bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 block p-2.5 pl-10 transition-all">
-                    <i data-lucide="search" class="absolute left-3 top-3 w-4 h-4 text-slate-500 pointer-events-none"></i>
-                </div>
-                <div class="relative">
-                    <select id="statusFilter" onchange="applyFilters()" class="bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 block p-2.5 pr-8 appearance-none cursor-pointer">
+                    <select id="statusFilter" onchange="filterGrid()" class="bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 block p-2.5 pr-8 appearance-none cursor-pointer">
                         <option value="all">Todos</option>
                         <option value="Extremamente Satisfeito">Extremamente Satisfeitos</option>
                         <option value="Satisfeito">Satisfeitos</option>
@@ -671,7 +605,7 @@ const DASHBOARD_HTML = `
                 </div>
                 <div class="relative group">
                     <input type="text" id="newCompanyInput" placeholder="Nova Empresa..." 
-                        class="w-56 bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 block p-2.5 pl-10 transition-all">
+                        class="w-64 bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 block p-2.5 pl-10 transition-all">
                     <i data-lucide="plus-circle" class="absolute left-3 top-3 w-4 h-4 text-slate-500"></i>
                 </div>
                 <button onclick="addCompany()" class="bg-white hover:bg-slate-200 text-slate-900 px-5 py-2.5 rounded-lg text-sm font-bold transition-all shadow-lg hover:shadow-xl flex items-center gap-2">
@@ -680,19 +614,6 @@ const DASHBOARD_HTML = `
             </div>
         </header>
         <div id="grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-6 pb-20"></div>
-
-        <!-- Modal de Histórico -->
-        <div id="historyModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-[100] hidden" onclick="closeModal()">
-            <div class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-2xl shadow-2xl shadow-indigo-500/10" onclick="event.stopPropagation()">
-                <div class="p-5 border-b border-slate-800 flex justify-between items-center">
-                    <h3 id="modalTitle" class="text-lg font-bold text-white">Histórico de Sentimento</h3>
-                    <button onclick="closeModal()" class="text-slate-500 hover:text-white p-2 -mr-2 rounded-full transition-colors"><i data-lucide="x" class="w-5 h-5"></i></button>
-                </div>
-                <div id="modalContent" class="p-6 bg-slate-900/50 rounded-b-2xl">
-                    <!-- Chart will be injected here -->
-                </div>
-            </div>
-        </div>
     </div>
     <script>
         lucide.createIcons();
@@ -705,184 +626,6 @@ const DASHBOARD_HTML = `
                 const data = await res.json();
                 grid.innerHTML = '';
                 if(data.length === 0) { 
-                    grid.innerHTML = '<div class="col-span-full text-center text-slate-600 py-32 font-mono">NO ACTIVE CLIENTS.</div>'; 
-                    return; 
-                }
-                data.forEach(emp => {
-                    grid.innerHTML += generateCardHTML(emp);
-                });
-                lucide.createIcons();
-            } catch (e) { 
-                grid.innerHTML = '<div class="col-span-full text-center text-red-400 font-mono py-20">SYSTEM FAILURE: API UNREACHABLE.</div>'; 
-            }
-        }
-
-        function applyFilters() {
-            const statusFilter = document.getElementById('statusFilter').value;
-            const searchFilter = document.getElementById('searchFilter').value.toLowerCase();
-            const cards = document.querySelectorAll('.company-card');
-            cards.forEach(card => {
-                const status = card.getAttribute('data-status');
-                const name = card.querySelector('h2').getAttribute('title').toLowerCase();
-                
-                const statusMatch = (statusFilter === 'all' || status === statusFilter);
-                const nameMatch = name.includes(searchFilter);
-
-                if (statusMatch && nameMatch) {
-                    card.style.display = 'flex';
-                } else {
-                    card.style.display = 'none';
-                }
-            });
-        }
-
-        async function summarize(nome, id) {
-            const card = document.getElementById('card-' + id);
-            if (!card) return;
-
-            const loadingOverlay = document.createElement('div');
-            loadingOverlay.className = 'absolute inset-0 bg-slate-900/80 backdrop-blur-sm flex flex-col items-center justify-center z-10 rounded-2xl';
-            loadingOverlay.innerHTML = '<i data-lucide="loader-2" class="animate-spin w-8 h-8 text-indigo-400"></i><p class="mt-3 text-sm text-indigo-300 font-mono">PROCESSANDO...</p>';
-            card.appendChild(loadingOverlay);
-            lucide.createIcons();
-
-            try {
-                const res = await fetch(API_URL + '/api/resumir-empresa', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ nome, id })
-                });
-                const json = await res.json();
-                if (json.success) {
-                    card.outerHTML = generateCardHTML(json.data);
-                    lucide.createIcons();
-                } else {
-                    alert('Erro: ' + (json.details || json.error)); 
-                    card.removeChild(loadingOverlay);
-                }
-            } catch (e) { 
-                alert('Erro de conexão: ' + e.message);
-                if (card.contains(loadingOverlay)) card.removeChild(loadingOverlay);
-            }
-        }
-
-        async function addCompany() {
-            const input = document.getElementById('newCompanyInput');
-            const nome = input.value.trim();
-            if(!nome) return;
-            try {
-                const res = await fetch(API_URL + '/api/empresas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nome }) });
-                const json = await res.json();
-                if(json.success) { input.value = ''; loadCompanies(); }
-            } catch(e) {}
-        }
-
-        function generateCardHTML(emp) {
-            const sCli = (emp.status_cliente || 'Neutro').replace(/\s/g, '');
-            const historyJson = JSON.stringify(emp.score_history || []);
-            const contentHtml = emp.resumo && emp.resumo.includes('<div') 
-                ? emp.resumo 
-                : \`<div class="flex flex-col items-center justify-center h-40 text-slate-500 gap-2"><i data-lucide="ghost" class="w-6 h-6 opacity-30"></i><p class="text-xs">Sem inteligência gerada.</p></div>\`;
-            const isUnlinked = !emp.doc_link;
-
-            return \`
-            <div id="card-\${emp.id}" class="glass-card rounded-2xl flex flex-col h-full relative group company-card \${isUnlinked ? 'is-unlinked' : ''}" data-status="\${emp.status_cliente || 'Neutro'}">
-                <div class="p-5 pb-3 border-b border-white/5">
-                    <div class="flex justify-between items-start mb-3">
-                        <h2 class="font-bold text-white text-lg tracking-tight truncate w-10/12 group-hover:text-indigo-300 transition-colors" title="\${emp.nome}">\${emp.nome}</h2>
-                        \${emp.doc_link ? \`<a href="\${emp.doc_link}" target="_blank" class="text-slate-600 hover:text-white transition-colors p-1 hover:bg-white/10 rounded"><i data-lucide="file-text" class="w-4 h-4"></i></a>\` : ''}
-                    </div>
-                    <div class="flex gap-2">
-                        <span class="badge st-\${sCli}">\${emp.status_cliente || 'PENDENTE'}</span>
-                    </div>
-                </div>
-                <div class="p-5 flex-grow text-sm">
-                    \${contentHtml}
-                </div>
-                <div class="p-4 mt-auto border-t border-white/5 bg-slate-900/30 rounded-b-2xl flex flex-col gap-3">
-                    <div class="flex gap-2">
-                        <button onclick="summarize('\${emp.nome.replace(/'/g, "\\\\'")}', \${emp.id})" id="btn-\${emp.id}" 
-                            class="flex-grow bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5 group-hover:border-indigo-500/30">
-                            <i data-lucide="zap" class="w-3 h-3"></i> 
-                            \${emp.resumo ? 'REPROCESSAR' : 'ANALISAR'}
-                        </button>
-                        <button 
-                            onclick='if(${(emp.score_history || []).length > 1}) openHistoryModal(${historyJson}, \`\${emp.nome.replace(/'/g, "\\\\'")}\`)'
-                            class="w-12 flex-shrink-0 flex items-center justify-center bg-slate-800 rounded-lg border border-white/5 \${(emp.score_history || []).length > 1 ? 'hover:bg-indigo-600 hover:border-indigo-500/30 cursor-pointer' : 'opacity-50 cursor-not-allowed'}"
-                            title="Ver Histórico de Score">
-                            <i data-lucide="bar-chart-3" class="w-4 h-4 text-slate-300"></i>
-                        </button>
-                    </div>
-                    <div class="flex justify-between items-center px-1">
-                        <span class="text-[9px] text-slate-600 uppercase font-bold tracking-wider">Last Sync</span>
-                        <span class="text-[9px] text-slate-500 font-mono">\${emp.last_updated ? new Date(emp.last_updated).toLocaleDateString() : '--/--'}</span>
-                    </div>
-                </div>
-            </div>\`;
-        }
-
-        // --- Modal & Chart Logic ---
-        function openHistoryModal(history, companyName) {
-            if (!history || history.length < 2) return;
-            const modal = document.getElementById('historyModal');
-            const title = document.getElementById('modalTitle');
-            const content = document.getElementById('modalContent');
-
-            title.innerText = \`Histórico de Sentimento: \${companyName}\`;
-            content.innerHTML = generateChartSVG(history);
-            modal.classList.remove('hidden');
-            lucide.createIcons();
-        }
-
-        function closeModal() {
-            document.getElementById('historyModal').classList.add('hidden');
-        }
-
-        function generateChartSVG(history) {
-            if (!history || history.length < 2) {
-                return \`<div class="text-center text-slate-500 py-10">Dados insuficientes para gerar gráfico (mínimo de 2 registros).</div>\`;
-            }
-            const W = 570, H = 250, PADDING = 40;
-            const points = history.map((p, i) => ({
-                x: PADDING + i * (W - 2 * PADDING) / (history.length - 1),
-                y: H - PADDING - (p.score / 10) * (H - 2 * PADDING),
-                score: p.score,
-                date: new Date(p.date)
-            }));
-
-            const pathD = "M" + points.map(p => \`\${p.x.toFixed(2)} \${p.y.toFixed(2)}\`).join(" L");
-
-            const circles = points.map(p => 
-                \`<g transform="translate(\${p.x}, \${p.y})">
-                    <circle cx="0" cy="0" r="8" fill="#6366f1" fill-opacity="0.2" />
-                    <circle cx="0" cy="0" r="4" fill="#a5b4fc" stroke="#0f172a" stroke-width="2" />
-                </g>\`
-            ).join('');
-
-            const xLabels = points.map((p, i) => {
-                if (history.length > 10 && i % 2 !== 0 && i !== history.length - 1 && i !== 0) return '';
-                const dateStr = p.date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
-                return \`<text x="\${p.x}" y="\${H - PADDING + 20}" fill="#94a3b8" font-size="10" text-anchor="middle">\${dateStr}</text>\`;
-            }).join('');
-
-            const yLabels = [0, 2, 4, 6, 8, 10].map(score => {
-                const y = H - PADDING - (score / 10) * (H - 2 * PADDING);
-                return \`<text x="\${PADDING - 10}" y="\${y}" fill="#94a3b8" font-size="10" text-anchor="end" dominant-baseline="middle">\${score}</text>
-                        <line x1="\${PADDING}" y1="\${y}" x2="\${W - PADDING}" y2="\${y}" stroke="#334155" stroke-width="0.5" />\`;
-            }).join('');
-
-            return \`<svg width="100%" height="\${H}" viewBox="0 0 \${W} \${H}">
-                \${yLabels}
-                <path d="\${pathD}" fill="none" stroke="#6366f1" stroke-width="2" />
-                \${circles}
-                \${xLabels}
-            </svg>\`;
-        }
-        loadCompanies();
-    </script>
-</body>
-</html>
-`;              if(data.length === 0) { 
                     grid.innerHTML = '<div class="col-span-full text-center text-slate-600 py-32 font-mono">NO ACTIVE CLIENTS.</div>'; 
                     return; 
                 }
@@ -921,7 +664,6 @@ const DASHBOARD_HTML = `
                             </div>
                         </div>
                     </div>\`;
-                    grid.innerHTML += generateCardHTML(emp);
                 });
                 lucide.createIcons();
             } catch (e) { 
@@ -930,43 +672,20 @@ const DASHBOARD_HTML = `
         }
         function filterGrid() {
             const filter = document.getElementById('statusFilter').value;
-
-        function applyFilters() {
-            const statusFilter = document.getElementById('statusFilter').value;
-            const searchFilter = document.getElementById('searchFilter').value.toLowerCase();
             const cards = document.querySelectorAll('.company-card');
             cards.forEach(card => {
                 const status = card.getAttribute('data-status');
                 if (filter === 'all' || status === filter) card.style.display = 'flex';
                 else card.style.display = 'none';
-                const name = card.querySelector('h2').getAttribute('title').toLowerCase();
-                
-                const statusMatch = (statusFilter === 'all' || status === statusFilter);
-                const nameMatch = name.includes(searchFilter);
-
-                if (statusMatch && nameMatch) {
-                    card.style.display = 'flex';
-                } else {
-                    card.style.display = 'none';
-                }
             });
         }
-
         async function summarize(nome, id) {
             const btn = document.getElementById('btn-' + id);
             const originalHTML = btn.innerHTML;
             btn.disabled = true; 
             btn.className = "w-full bg-indigo-600/20 text-indigo-300 py-2.5 rounded-lg text-xs font-bold flex justify-center items-center gap-2 cursor-wait border border-indigo-500/30 animate-pulse";
             btn.innerHTML = '<i data-lucide="loader-2" class="animate-spin w-3 h-3"></i> EXTRAINDO INTELIGÊNCIA...';
-            const card = document.getElementById('card-' + id);
-            if (!card) return;
-
-            const loadingOverlay = document.createElement('div');
-            loadingOverlay.className = 'absolute inset-0 bg-slate-900/80 backdrop-blur-sm flex flex-col items-center justify-center z-10 rounded-2xl';
-            loadingOverlay.innerHTML = '<i data-lucide="loader-2" class="animate-spin w-8 h-8 text-indigo-400"></i><p class="mt-3 text-sm text-indigo-300 font-mono">PROCESSANDO...</p>';
-            card.appendChild(loadingOverlay);
             lucide.createIcons();
-
             try {
                 const res = await fetch(API_URL + '/api/resumir-empresa', {
                     method: 'POST',
@@ -977,14 +696,9 @@ const DASHBOARD_HTML = `
                 if (json.success) { 
                     loadCompanies(); 
                 } else { 
-                if (json.success) {
-                    card.outerHTML = generateCardHTML(json.data);
-                    lucide.createIcons();
-                } else {
                     alert('Erro: ' + (json.details || json.error)); 
                     btn.innerHTML = 'FALHA NA EXTRAÇÃO';
                     btn.className = "w-full bg-red-900/20 text-red-400 border border-red-500/30 py-2.5 rounded-lg text-xs font-bold";
-                    card.removeChild(loadingOverlay);
                 }
             } catch (e) { 
                 btn.innerHTML = 'ERRO DE CONEXÃO';
@@ -998,11 +712,8 @@ const DASHBOARD_HTML = `
                         lucide.createIcons();
                     }, 3000);
                 }
-                alert('Erro de conexão: ' + e.message);
-                if (card.contains(loadingOverlay)) card.removeChild(loadingOverlay);
             }
         }
-
         async function addCompany() {
             const input = document.getElementById('newCompanyInput');
             const nome = input.value.trim();
@@ -1012,108 +723,6 @@ const DASHBOARD_HTML = `
                 const json = await res.json();
                 if(json.success) { input.value = ''; loadCompanies(); }
             } catch(e) {}
-        }
-
-        function generateCardHTML(emp) {
-            const sCli = (emp.status_cliente || 'Neutro').replace(/\s/g, '');
-            const historyJson = JSON.stringify(emp.score_history || []);
-            const contentHtml = emp.resumo && emp.resumo.includes('<div') 
-                ? emp.resumo 
-                : \`<div class="flex flex-col items-center justify-center h-40 text-slate-500 gap-2"><i data-lucide="ghost" class="w-6 h-6 opacity-30"></i><p class="text-xs">Sem inteligência gerada.</p></div>\`;
-            const isUnlinked = !emp.doc_link;
-
-            return \`
-            <div id="card-\${emp.id}" class="glass-card rounded-2xl flex flex-col h-full relative group company-card \${isUnlinked ? 'is-unlinked' : ''}" data-status="\${emp.status_cliente || 'Neutro'}">
-                <div class="p-5 pb-3 border-b border-white/5">
-                    <div class="flex justify-between items-start mb-3">
-                        <h2 class="font-bold text-white text-lg tracking-tight truncate w-10/12 group-hover:text-indigo-300 transition-colors" title="\${emp.nome}">\${emp.nome}</h2>
-                        \${emp.doc_link ? \`<a href="\${emp.doc_link}" target="_blank" class="text-slate-600 hover:text-white transition-colors p-1 hover:bg-white/10 rounded"><i data-lucide="file-text" class="w-4 h-4"></i></a>\` : ''}
-                    </div>
-                    <div class="flex gap-2">
-                        <span class="badge st-\${sCli}">\${emp.status_cliente || 'PENDENTE'}</span>
-                    </div>
-                </div>
-                <div class="p-5 flex-grow text-sm">
-                    \${contentHtml}
-                </div>
-                <div class="p-4 mt-auto border-t border-white/5 bg-slate-900/30 rounded-b-2xl flex flex-col gap-3">
-                    <div class="flex gap-2">
-                        <button onclick="summarize('\${emp.nome.replace(/'/g, "\\\\'")}', \${emp.id})" id="btn-\${emp.id}" 
-                            class="flex-grow bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5 group-hover:border-indigo-500/30">
-                            <i data-lucide="zap" class="w-3 h-3"></i> 
-                            \${emp.resumo ? 'REPROCESSAR' : 'ANALISAR'}
-                        </button>
-                        <button 
-                            onclick='if(${(emp.score_history || []).length > 1}) openHistoryModal(${historyJson}, \`\${emp.nome.replace(/'/g, "\\\\'")}\`)'
-                            class="w-12 flex-shrink-0 flex items-center justify-center bg-slate-800 rounded-lg border border-white/5 \${(emp.score_history || []).length > 1 ? 'hover:bg-indigo-600 hover:border-indigo-500/30 cursor-pointer' : 'opacity-50 cursor-not-allowed'}"
-                            title="Ver Histórico de Score">
-                            <i data-lucide="bar-chart-3" class="w-4 h-4 text-slate-300"></i>
-                        </button>
-                    </div>
-                    <div class="flex justify-between items-center px-1">
-                        <span class="text-[9px] text-slate-600 uppercase font-bold tracking-wider">Last Sync</span>
-                        <span class="text-[9px] text-slate-500 font-mono">\${emp.last_updated ? new Date(emp.last_updated).toLocaleDateString() : '--/--'}</span>
-                    </div>
-                </div>
-            </div>\`;
-        }
-
-        // --- Modal & Chart Logic ---
-        function openHistoryModal(history, companyName) {
-            if (!history || history.length < 2) return;
-            const modal = document.getElementById('historyModal');
-            const title = document.getElementById('modalTitle');
-            const content = document.getElementById('modalContent');
-
-            title.innerText = \`Histórico de Sentimento: \${companyName}\`;
-            content.innerHTML = generateChartSVG(history);
-            modal.classList.remove('hidden');
-            lucide.createIcons();
-        }
-
-        function closeModal() {
-            document.getElementById('historyModal').classList.add('hidden');
-        }
-
-        function generateChartSVG(history) {
-            if (!history || history.length < 2) {
-                return \`<div class="text-center text-slate-500 py-10">Dados insuficientes para gerar gráfico (mínimo de 2 registros).</div>\`;
-            }
-            const W = 570, H = 250, PADDING = 40;
-            const points = history.map((p, i) => ({
-                x: PADDING + i * (W - 2 * PADDING) / (history.length - 1),
-                y: H - PADDING - (p.score / 10) * (H - 2 * PADDING),
-                score: p.score,
-                date: new Date(p.date)
-            }));
-
-            const pathD = "M" + points.map(p => \`\${p.x.toFixed(2)} \${p.y.toFixed(2)}\`).join(" L");
-
-            const circles = points.map(p => 
-                \`<g transform="translate(\${p.x}, \${p.y})">
-                    <circle cx="0" cy="0" r="8" fill="#6366f1" fill-opacity="0.2" />
-                    <circle cx="0" cy="0" r="4" fill="#a5b4fc" stroke="#0f172a" stroke-width="2" />
-                </g>\`
-            ).join('');
-
-            const xLabels = points.map((p, i) => {
-                if (history.length > 10 && i % 2 !== 0 && i !== history.length - 1 && i !== 0) return '';
-                const dateStr = p.date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
-                return \`<text x="\${p.x}" y="\${H - PADDING + 20}" fill="#94a3b8" font-size="10" text-anchor="middle">\${dateStr}</text>\`;
-            }).join('');
-
-            const yLabels = [0, 2, 4, 6, 8, 10].map(score => {
-                const y = H - PADDING - (score / 10) * (H - 2 * PADDING);
-                return \`<text x="\${PADDING - 10}" y="\${y}" fill="#94a3b8" font-size="10" text-anchor="end" dominant-baseline="middle">\${score}</text>
-                        <line x1="\${PADDING}" y1="\${y}" x2="\${W - PADDING}" y2="\${y}" stroke="#334155" stroke-width="0.5" />\`;
-            }).join('');
-
-            return \`<svg width="100%" height="\${H}" viewBox="0 0 \${W} \${H}">
-                \${yLabels}
-                <path d="\${pathD}" fill="none" stroke="#6366f1" stroke-width="2" />
-                \${circles}
-                \${xLabels}
-            </svg>\`;
         }
         loadCompanies();
     </script>
