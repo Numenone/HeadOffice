@@ -57,8 +57,7 @@ function getGoogleAuth() {
             private_key: privateKey,
         },
         scopes: [
-            'https://www.googleapis.com/auth/documents.readonly',
-            'https://www.googleapis.com/auth/spreadsheets.readonly'
+            'https://www.googleapis.com/auth/documents.readonly'
         ],
     });
 }
@@ -161,32 +160,21 @@ function optimizeTextForGet(text) {
     }
 }
 
-// --- BUSCA PLANILHA (VIA API GOOGLE) ---
+// --- BUSCA PLANILHA (VIA CSV PÚBLICO) ---
 async function findDocLinkInSheet(companyName) {
-    const auth = getGoogleAuth();
-    const client = await auth.getClient();
-    const sheets = google.sheets({ version: 'v4', auth: client });
-
     try {
-        const res = await sheets.spreadsheets.values.get({
-            spreadsheetId: SHEET_ID,
-            range: 'A:Z', 
-        });
-
-        const rows = res.data.values;
-        if (!rows || rows.length === 0) return null;
+        const response = await axios.get(SHEET_CSV_URL);
+        const rows = response.data.split(/\r?\n/);
 
         for (const row of rows) {
-            const strRow = row.join(' ').toLowerCase();
-            if (strRow.includes(companyName.toLowerCase())) {
-                const link = row.find(cell => cell.includes('docs.google.com/document/d/'));
-                if (link) return link;
+            if (row.toLowerCase().includes(companyName.toLowerCase())) {
+                const match = row.match(/https:\/\/docs\.google\.com\/document\/d\/[a-zA-Z0-9_-]+/);
+                if (match) return match[0];
             }
         }
         return null;
     } catch (error) {
-        if (error.code === 403) throw new Error("Acesso negado à Planilha.");
-        throw error;
+        throw new Error("Erro ao acessar Planilha (CSV): " + error.message);
     }
 }
 
@@ -622,6 +610,14 @@ const DASHBOARD_HTML = `
             try {
                 const res = await fetch(API_URL + '/api/empresas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nome }) });
                 const json = await res.json();
+                if(json.success) { input.value = ''; loadCompanies(); }
+            } catch(e) {}
+        }
+        loadCompanies();
+    </script>
+</body>
+</html>
+`;              const json = await res.json();
                 if(json.success) { input.value = ''; loadCompanies(); }
             } catch(e) {}
         }
