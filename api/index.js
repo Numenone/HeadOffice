@@ -260,20 +260,25 @@ app.post('/api/empresas', async (req, res) => {
 
 async function processCompanyIntelligence(id, nome, existingHistory = null) {
     const authHeader = getHeadOfficeToken();
-    
-    let docId = null;
-    let docUrl = null;
-
     if (!authHeader) return { success: false, error: "Token HeadOffice inválido." };
 
-    let history = existingHistory;
-    if (history === null) {
-        // Se o histórico não foi passado (ex: chamada única), busca no DB
-        const { data: companyData } = await supabase.from('empresas').select('score_history').eq('id', id).single();
-        history = companyData?.score_history || [];
-    }
+    let docId = null;
+    let docUrl = null;
+    let history = existingHistory || [];
 
     try {
+        // Se não veio histórico, busca no banco
+        if (!existingHistory) {
+            const { data: companyData, error: historyError } = await supabase
+                .from('empresas')
+                .select('score_history')
+                .eq('id', id)
+                .single();
+            
+            if (historyError) throw historyError;
+            history = companyData?.score_history || [];
+        }
+
         // 1. LINK NO CSV
         try {
             const csvResponse = await axios.get(SHEET_CSV_URL);
@@ -281,14 +286,16 @@ async function processCompanyIntelligence(id, nome, existingHistory = null) {
             for (const line of lines) {
                 if (line.toLowerCase().includes(nome.toLowerCase())) {
                     const match = line.match(/\/d\/([a-zA-Z0-9_-]+)/);
-                    if (match) { 
+                    if (match) {
                         docId = match[1];
                         docUrl = `https://docs.google.com/document/d/${docId}`;
-                        break; 
+                        break;
                     }
                 }
             }
-        } catch (e) { console.warn(`CSV Error para ${nome}`); }
+        } catch (e) {
+            console.warn(`CSV Error para ${nome}: ${e.message}`);
+        }
 
         if (!docId) return { success: false, error: `Link não encontrado para ${nome}.` };
 
