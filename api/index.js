@@ -750,6 +750,7 @@ const DASHBOARD_HTML = `
                                 </button>
                                 <button 
                                     onclick='if((emp.score_history || []).length > 1) openHistoryModal(\${historyJson}, \`\${emp.nome.replace(/'/g, "\\\\'")}\`)'
+                                    onclick='if((emp.score_history || []).length > 1) openHistoryModal(\`\${historyJson}\`, \`\${emp.nome.replace(/'/g, "\\\\'")}\`)'
                                     class="w-12 flex-shrink-0 flex items-center justify-center bg-slate-800 rounded-lg border border-white/5 \${(emp.score_history || []).length > 1 ? 'hover:bg-indigo-600 hover:border-indigo-500/30 cursor-pointer' : 'opacity-50 cursor-not-allowed'}"
                                     title="Ver Histórico de Score">
                                     <i data-lucide="bar-chart-3" class="w-4 h-4 text-slate-300"></i>
@@ -853,12 +854,17 @@ const DASHBOARD_HTML = `
         // --- Modal & Chart Logic ---
         function openHistoryModal(history, companyName) {
             if (!history || history.length < 2) return;
+            if (!history) return;
             const modal = document.getElementById('historyModal');
             const title = document.getElementById('modalTitle');
             const content = document.getElementById('modalContent');
 
+            const historyData = JSON.parse(history);
+            if (!historyData || historyData.length < 2) return;
+
             title.innerText = \`Histórico de Sentimento: \${companyName}\`;
             content.innerHTML = generateChartSVG(history);
+            content.innerHTML = generateChartSVG(historyData);
             modal.classList.remove('hidden');
             lucide.createIcons();
         }
