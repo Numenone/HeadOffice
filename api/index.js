@@ -529,7 +529,7 @@ async function processCompanyIntelligence(id, nome, existingHistory = null) {
             </div>
         `;
 
-        const updatePayload = {
+        const updatePayloadForDB = {
             doc_link: docUrl,
             resumo: htmlResumo,
             pontos_importantes: "Ver card",
@@ -538,8 +538,14 @@ async function processCompanyIntelligence(id, nome, existingHistory = null) {
             last_updated: new Date()
         };
 
-        await supabase.from('empresas').update(updatePayload).eq('id', id);
-        return { success: true, data: updatePayload };
+        await supabase.from('empresas').update(updatePayloadForDB).eq('id', id);
+        
+        const returnPayload = {
+            ...updatePayloadForDB,
+            id: id,
+            nome: nome
+        };
+        return { success: true, data: returnPayload };
 
     } catch (error) {
         console.error(`[ERRO FATAL] para ${nome}:`, error.message);
@@ -549,11 +555,16 @@ async function processCompanyIntelligence(id, nome, existingHistory = null) {
 
 app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
-    const result = await processCompanyIntelligence(id, nome);
-    if (!result || !result.success) {
-        return res.status(500).json(result);
+    try {
+        const result = await processCompanyIntelligence(id, nome);
+        if (!result || !result.success) {
+            return res.status(500).json(result);
+        }
+        res.json(result);
+    } catch (error) {
+        console.error(`[CRASH] em /api/resumir-empresa: ${error.message}`);
+        res.status(500).json({ error: "Erro inesperado no servidor.", details: error.message });
     }
-    res.json(result);
 });
 
 // --- ROTA CRON (ATUALIZAÇÃO DIÁRIA) ---
