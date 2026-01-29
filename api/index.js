@@ -35,6 +35,7 @@ function getHeadOfficeToken() {
     let rawToken = process.env.HEADOFFICE_API_KEY || process.env.HEADOFFICE_JWT || "";
     rawToken = rawToken.trim();
     if (rawToken.startsWith('"') && rawToken.endsWith('"')) rawToken = rawToken.slice(1, -1);
+    // Remove "Bearer" para evitar erro 403 da API
     if (rawToken.toLowerCase().startsWith('bearer')) {
         rawToken = rawToken.replace(/^bearer\s+/i, "").trim();
     }
@@ -59,28 +60,43 @@ function getGoogleAuth() {
     });
 }
 
-// --- 1. PARSER DE DATAS BR ---
+// --- 1. PARSER DE DATAS BR (ROBUSTO) ---
 function parseDateFromTitle(title) {
     if (!title) return null;
     const lower = title.toLowerCase();
+
+    // Mapa de meses (aceita abrev e full)
     const meses = { 
         "jan": 0, "fev": 1, "mar": 2, "abr": 3, "mai": 4, "jun": 5, "jul": 6, "ago": 7, "set": 8, "out": 9, "nov": 10, "dez": 11,
         "janeiro": 0, "fevereiro": 1, "março": 2, "abril": 3, "maio": 4, "junho": 5, "julho": 6, "agosto": 7, "setembro": 8, "outubro": 9, "novembro": 10, "dezembro": 11
     };
+
+    // 1. Tenta formato extenso: "14 de jan" ou "14 jan" ou "14 de janeiro"
+    // Regex captura dia e mês (primeiros 3 chars ou nome completo)
     const regexExt = /(\d{1,2})\s*(?:de)?\s*([a-zç]{3,})/;
     let match = lower.match(regexExt);
+
     if (match) {
         const day = parseInt(match[1]);
         let monthStr = match[2];
+        // Normaliza "jan." para "jan"
         if (monthStr.length > 3) monthStr = monthStr.substring(0, 3);
+        // Trata "março" -> "mar"
         if (monthStr === 'mar' || monthStr === 'març') monthStr = 'mar';
+        
         const month = meses[monthStr];
+        
+        // Tenta achar ano na string (ex: 2026), senão usa atual
         const yearMatch = lower.match(/20\d{2}/);
         const year = yearMatch ? parseInt(yearMatch[0]) : new Date().getFullYear();
+
         if (month !== undefined) return new Date(year, month, day);
     }
+
+    // 2. Tenta formato numérico: "14/01/26" ou "14-01-2026"
     const regexNum = /(\d{1,2})[\/\.\-](\d{1,2})(?:[\/\.\-](\d{2,4}))?/;
     match = lower.match(regexNum);
+    
     if (match) {
         const day = parseInt(match[1]);
         const month = parseInt(match[2]) - 1;
@@ -88,13 +104,15 @@ function parseDateFromTitle(title) {
         if (year < 100) year += 2000;
         return new Date(year, month, day);
     }
-    return null;
+
+    return null; // Sem data identificável
 }
 
 // --- 2. EXTRATOR DE TEXTO ---
 function readStructuralElements(elements) {
     let text = '';
     if (!elements) return text;
+
     elements.forEach(element => {
         if (element.paragraph) {
             element.paragraph.elements.forEach(el => {
@@ -125,32 +143,50 @@ function extractJSON(text) {
     return text;
 }
 
-// --- 3. CORTE INTELIGENTE ---
+// --- 3. CORTE INTELIGENTE ("SNIPER") ---
 function optimizeTextForGet(text) {
     if (!text) return "";
     let clean = text;
+
+    // A. Remove o Lixo (Rodapé e Transcrição Bruta)
     const lower = clean.toLowerCase();
     const endMarkers = ["revise as anotações do gemini", "00:00:00", "envie feedback sobre o uso", "transcrição\n00:"];
+    
     let cutoff = clean.length;
     for (const m of endMarkers) {
         const idx = lower.indexOf(m);
         if (idx !== -1 && idx < cutoff) cutoff = idx;
     }
     clean = clean.substring(0, cutoff).trim();
+
+    // B. Compressão de Espaços
     clean = clean.replace(/\n\s*\n/g, '\n').replace(/\s+/g, ' ');
+
+    // C. Estratégia de Corte para URL (Max ~1800 chars)
     const MAX = 1800;
     if (clean.length <= MAX) return clean;
+
+    // SE O TEXTO FOR GRANDE:
+    // Prioridade 1: O Início (Resumo)
+    // Prioridade 2: As "Próximas Etapas" (Geralmente no final ou buscáveis)
+    
+    // Tenta achar onde começam os "Próximos Passos"
     const stepsMarkers = ["próximas etapas", "próximos passos", "ações futuras", "encaminhamentos"];
     let stepsIdx = -1;
+    
     for (const sm of stepsMarkers) {
         const idx = clean.toLowerCase().lastIndexOf(sm);
         if (idx !== -1) { stepsIdx = idx; break; }
     }
+
     if (stepsIdx !== -1) {
+        // Se achou "Próximos Passos", garante que eles entrem!
+        // Pega os primeiros 800 chars (Resumo) + Os 1000 chars a partir dos Próximos Passos
         const head = clean.substring(0, 800);
-        const tail = clean.substring(stepsIdx, stepsIdx + 1000); 
+        const tail = clean.substring(stepsIdx, stepsIdx + 1000); // Pega 1000 chars a partir do marcador
         return `${head} ... [MEIO OMITIDO] ... ${tail}`;
     } else {
+        // Se não achou marcador explícito, pega Início e Fim (Sanduíche Clássico)
         const head = clean.substring(0, 1000);
         const tail = clean.substring(clean.length - 800);
         return `${head} ... [MEIO OMITIDO] ... ${tail}`;
@@ -162,10 +198,14 @@ async function getAllTabsSorted(docId) {
     const auth = getGoogleAuth();
     const client = await auth.getClient();
     const docs = google.docs({ version: 'v1', auth: client });
+
     console.log(`[GCP] Baixando Doc: ${docId}`);
     const res = await docs.documents.get({ documentId: docId });
     const doc = res.data;
+
     let tabsData = [];
+
+    // Processa Abas
     if (doc.tabs && doc.tabs.length > 0) {
         doc.tabs.forEach(t => {
             const title = t.tabProperties.title || "Sem Título";
@@ -175,7 +215,12 @@ async function getAllTabsSorted(docId) {
                 content = readStructuralElements(t.documentTab.body.content);
             }
             if (content.trim().length > 0) {
-                tabsData.push({ title: title, date: date, timestamp: date ? date.getTime() : 0, content: content });
+                tabsData.push({
+                    title: title,
+                    date: date,
+                    timestamp: date ? date.getTime() : 0, 
+                    content: content
+                });
             }
         });
     } else {
@@ -184,7 +229,13 @@ async function getAllTabsSorted(docId) {
             tabsData.push({ title: "Principal", date: null, timestamp: 0, content: content });
         }
     }
+
+    // ORDENAÇÃO CRÍTICA: Antiga -> Recente
     tabsData.sort((a, b) => a.timestamp - b.timestamp);
+    
+    // Debug de Datas no Log
+    tabsData.forEach(t => console.log(`[TAB] ${t.title} -> ${t.date ? t.date.toLocaleDateString() : 'S/D'}`));
+
     return tabsData;
 }
 
@@ -204,11 +255,12 @@ app.post('/api/empresas', async (req, res) => {
 });
 
 // ======================================================
-// LÓGICA DE INTELIGÊNCIA
+// LÓGICA DE INTELIGÊNCIA (DIRECTOR MODE + SNIPER)
 // ======================================================
 
 async function processCompanyIntelligence(id, nome, existingHistory = null) {
     const authHeader = getHeadOfficeToken();
+    
     let docId = null;
     let docUrl = null;
     let history = existingHistory || [];
@@ -216,136 +268,293 @@ async function processCompanyIntelligence(id, nome, existingHistory = null) {
     if (!authHeader) return { success: false, error: "Token HeadOffice inválido." };
 
     try {
+        // Se não veio histórico, busca no banco
         if (!existingHistory) {
-            const { data: companyData, error: historyError } = await supabase.from('empresas').select('score_history').eq('id', id).single();
-            if (!historyError) history = companyData?.score_history || [];
+            const { data: companyData, error: historyError } = await supabase
+                .from('empresas')
+                .select('score_history')
+                .eq('id', id)
+                .single();
+            
+            if (historyError) {
+                console.warn("Erro ao buscar histórico antigo, iniciando novo.", historyError.message);
+            } else {
+                history = companyData?.score_history || [];
+            }
         }
 
+        // 1. LINK NO CSV
         try {
             const csvResponse = await axios.get(SHEET_CSV_URL);
             const lines = csvResponse.data.split('\n');
             for (const line of lines) {
                 if (line.toLowerCase().includes(nome.toLowerCase())) {
                     const match = line.match(/\/d\/([a-zA-Z0-9_-]+)/);
-                    if (match) { docId = match[1]; docUrl = `https://docs.google.com/document/d/${docId}`; break; }
+                    if (match) { 
+                        docId = match[1];
+                        docUrl = `https://docs.google.com/document/d/${docId}`;
+                        break; 
+                    }
                 }
             }
-        } catch (e) { console.warn(`CSV Error: ${e.message}`); }
+        } catch (e) { console.warn(`CSV Error para ${nome}`); }
 
         if (!docId) return { success: false, error: `Link não encontrado para ${nome}.` };
 
+        // 2. LER ABAS (GCP)
         let allTabs = [];
         try {
             allTabs = await getAllTabsSorted(docId);
             if (allTabs.length === 0) return { success: false, error: "Doc vazio." };
-        } catch (apiError) { return { success: false, error: "Erro GCP: " + apiError.message }; }
+        } catch (apiError) {
+            return { success: false, error: "Erro GCP: " + apiError.message };
+        }
 
+        // 3. ANÁLISE EM CADEIA
         let currentMemory = "Início da análise.";
+        console.log(`[IA] Processando ${allTabs.length} abas em ordem cronológica.`);
+
         for (let i = 0; i < allTabs.length; i++) {
             const tab = allTabs[i];
             const isLast = i === allTabs.length - 1;
-            const cleanContent = optimizeTextForGet(tab.content);
             
+            // --- CORTE ESTRATÉGICO PARA GET ---
+            const cleanContent = optimizeTextForGet(tab.content);
+            console.log(`[IA] Aba ${i+1} (${tab.title}): ${cleanContent.length} chars enviados.`);
+
             let prompt = "";
             let contextForUrl = "";
 
             if (!isLast) {
-                prompt = `ATUE COMO CS MANAGER. REUNIÃO PASSADA: ${tab.title}. MEMÓRIA ATUAL: ${currentMemory}. RESUMO DESTA REUNIÃO: ${cleanContent}. INSTRUÇÃO: Atualize a memória com fatos importantes. Seja conciso.`;
+                // ABAS PASSADAS: Acumula contexto
+                prompt = `ATUE COMO CS MANAGER.
+                REUNIÃO PASSADA: ${tab.title}.
+                
+                MEMÓRIA ATUAL: ${currentMemory}
+                
+                RESUMO DESTA REUNIÃO:
+                ${cleanContent}
+                
+                INSTRUÇÃO:
+                Atualize a memória com fatos importantes (sentimento, decisões).
+                Seja conciso (max 1000 chars).`;
+                
                 contextForUrl = `MEMÓRIA: ${currentMemory.slice(0, 1000)}`; 
+
             } else {
+                // ABA FINAL: O Diretor assume
                 prompt = `ATUE COMO DIRETOR DE CS. ESTA É A ÚLTIMA REUNIÃO (${tab.title}).
                 
-                DADOS:
-                1. Histórico Prévio: ${currentMemory.slice(0, 600)}
+                --- MISSÃO FINAL ---
+                Gere o Relatório de Inteligência Estratégico.
+                
+                DADOS DE ENTRADA:
+                1. Histórico Prévio (Perfil/Sentimento): ${currentMemory.slice(0, 600)}
                 2. TEXTO DA ÚLTIMA REUNIÃO:
                 ${cleanContent}
                 
                 REGRAS RÍGIDAS PARA 'sentimento_score':
-                1. PRINCÍPIO: Avalie ESTRITAMENTE o HUMOR/EMOÇÃO. Ignore prazos de projeto.
-                2. ESCALA:
-                   - 9-10 (Extremamente Satisfeito): Elogios explícitos ("incrível", "amei").
-                   - 7-8 (Satisfeito): Colaborativo, positivo, normal. (PADRÃO PARA CLIENTE SEM PROBLEMAS).
-                   - 5-6 (Neutro): Frio, monossilábico, apenas profissional.
-                   - 0-4 (Insatisfeito/Crítico): Reclamações, irritação, atritos.
-                
-                ANÁLISE DE TEMPERATURA: Compare a reunião atual com o histórico. (aquecendo|estável|esfriando).
+                1. **PRINCÍPIO GUIA**: Comece com uma nota base de 7 (Satisfeito) para uma interação profissional e colaborativa. A nota só deve cair abaixo de 7 se houver sinais CLAROS de problemas.
+                2. **AVALIE O SENTIMENTO, NÃO O PROJETO**: O score reflete o HUMOR e a EMOÇÃO do cliente. Ignore o status de tarefas (atrasadas/em dia). Um cliente calmo e parceiro em um projeto com problemas deve ter nota ALTA (7+).
+                3. **QUANDO AUMENTAR A NOTA (8-10)**:
+                    - **Score 10 (Apaixonado)**: Elogios explícitos e repetidos ("incrível", "excelente", "adorando", "melhorou muito"). Cliente age como um promotor da marca.
+                    - **Score 8-9 (Feliz)**: Tom consistentemente positivo, proativo, construtivo. Demonstrações claras de contentamento com os resultados ou com a parceria.
+                4. **QUANDO MANTER A NOTA (7)**:
+                    - **Score 7 (Satisfeito)**: Cliente colaborativo, tom positivo, profissional. A reunião flui bem, sem atritos. Este é o padrão para um bom relacionamento.
+                5. **QUANDO DIMINUIR A NOTA (0-6)**:
+                    - **Score 5-6 (Neutro/Alerta)**: Cliente transacional, apático, monossilábico ou demonstra baixo engajamento/desinteresse. A conversa é estritamente profissional, sem cordialidade.
+                    - **Score 3-4 (Insatisfeito)**: Sinais de preocupação, frustração, reclamações leves, rejeição de entregas, ou atritos na conversa.
+                    - **Score 0-2 (Crítico)**: Cliente irritado, hostil, usando linguagem grosseira, ou mencionando diretamente riscos de cancelamento/crise.
+                6. **EXTRAÇÃO DE DADOS**: 'proximos_passos' e 'checkpoints_feitos' devem ser extraídos SOMENTE do "TEXTO DA ÚLTIMA REUNIÃO". Se o texto citar Felipe, Barbara, William, use os nomes. Nunca invente dados.
+                7. **ANÁLISE DE TEMPERATURA**: Compare o sentimento da "ÚLTIMA REUNIÃO" com o "Histórico Prévio".
+                    - "aquecendo": O sentimento melhorou significativamente ou o cliente está notavelmente mais positivo.
+                    - "estável": O sentimento se manteve consistente (seja positivo, neutro ou negativo).
+                    - "esfriando": O sentimento piorou, surgiram novas preocupações, atritos ou desinteresse.
         
-                FORMATO JSON ESTRITO:
+                FORMATO DE RESPOSTA:
+                JSON ESTRITO (Responda APENAS o JSON):
                 {"resumo_executivo": "...", "perfil_cliente": "...", "estrategia_relacionamento": "...", "checkpoints_feitos": [], "proximos_passos": [], "riscos_bloqueios": "...", "sentimento_score": "0-10", "temperatura_geral": "aquecendo|estável|esfriando"}`;
             }
 
+            // CHAMADA GET (Safe)
             let respostaIA = "";
             for (let retry = 0; retry < 2; retry++) {
                 try {
                     const response = await axios.get(`${BASE_URL}/openai/question`, {
-                        params: { aiName: BOT_NAME, aiId: BOT_ID, question: prompt, context: isLast ? "Foco na última reunião." : contextForUrl },
+                        params: {
+                            aiName: BOT_NAME,
+                            aiId: BOT_ID,
+                            question: prompt,
+                            context: isLast ? "Foco na última reunião." : contextForUrl // O prompt final já tem o texto embutido
+                        },
                         headers: { 'Authorization': authHeader },
                         timeout: 40000
                     });
+                    
                     const tResp = response.data.text || response.data.answer;
-                    if (tResp && tResp.trim().length > 2) { respostaIA = tResp; break; }
+                    if (tResp && tResp.trim().length > 2) {
+                        respostaIA = tResp;
+                        break; 
+                    }
                 } catch (e) { 
+                    console.error(`Erro IA Aba ${i}: ${e.message}`);
                     if (e.response && e.response.status === 414) {
                         try {
+                            // Fallback: Reduz contexto para 500 chars se der erro de URL
                             const miniContext = contextForUrl.slice(0, 500);
-                            const r2 = await axios.get(`${BASE_URL}/openai/question`, { params: { aiName: BOT_NAME, aiId: BOT_ID, question: prompt, context: miniContext }, headers: { 'Authorization': authHeader } });
+                            const r2 = await axios.get(`${BASE_URL}/openai/question`, {
+                                params: { aiName: BOT_NAME, aiId: BOT_ID, question: prompt, context: miniContext },
+                                headers: { 'Authorization': authHeader }
+                            });
                             respostaIA = r2.data.text || r2.data.answer;
                         } catch(e2) {}
                     }
                 }
             }
-            if (respostaIA) currentMemory = respostaIA;
+
+            if (respostaIA) {
+                currentMemory = respostaIA;
+            }
         }
 
+        // 4. FINALIZAR
         const jsonOnly = extractJSON(currentMemory);
         let data = {};
-        try { data = JSON.parse(jsonOnly); } catch (e) { data = { resumo_executivo: "Erro ao processar JSON." }; }
 
+        try {
+            data = JSON.parse(jsonOnly);
+        } catch (e) {
+            data = { resumo_executivo: "Erro ao processar JSON. Logs: " + currentMemory.substring(0, 300) };
+        }
+
+        // Atualiza histórico de score
         history.push({ score: parseInt(data.sentimento_score, 10) || 5, date: new Date().toISOString() });
-        const updatedHistory = history.slice(-12);
+        const updatedHistory = history.slice(-12); // Mantém os últimos 12 registros
 
-        const score = parseInt(data.sentimento_score, 10) || 5;
+        const score = parseInt(data.sentimento_score, 10) || 5; // Default to Neutro
         let scoreColor, statusCliente;
-        if (score >= 9) { statusCliente = "Extremamente Satisfeito"; scoreColor = "text-cyan-400 border-cyan-500/30 bg-cyan-500/10"; }
-        else if (score >= 7) { statusCliente = "Satisfeito"; scoreColor = "text-emerald-400 border-emerald-500/30 bg-emerald-500/10"; }
-        else if (score >= 5) { statusCliente = "Neutro"; scoreColor = "text-yellow-400 border-yellow-500/30 bg-yellow-500/10"; }
-        else if (score >= 3) { statusCliente = "Insatisfeito"; scoreColor = "text-orange-400 border-orange-500/30 bg-orange-500/10"; }
-        else { statusCliente = "Crítico"; scoreColor = "text-red-400 border-red-500/30 bg-red-500/10"; }
+
+        if (score >= 9) {
+            statusCliente = "Extremamente Satisfeito";
+            scoreColor = "text-cyan-400 border-cyan-500/30 bg-cyan-500/10";
+        } else if (score >= 7) {
+            statusCliente = "Satisfeito";
+            scoreColor = "text-emerald-400 border-emerald-500/30 bg-emerald-500/10";
+        } else if (score >= 5) {
+            statusCliente = "Neutro";
+            scoreColor = "text-yellow-400 border-yellow-500/30 bg-yellow-500/10";
+        } else if (score >= 3) {
+            statusCliente = "Insatisfeito";
+            scoreColor = "text-orange-400 border-orange-500/30 bg-orange-500/10";
+        } else {
+            statusCliente = "Crítico";
+            scoreColor = "text-red-400 border-red-500/30 bg-red-500/10";
+        }
+
+        const lastTabName = allTabs.length > 0 ? allTabs[allTabs.length-1].title : "Geral";
 
         const temperatura = data.temperatura_geral;
         let temperaturaHtml = '';
         if (temperatura) {
-            let tempIcon = 'minus'; let tempColor = 'text-yellow-400';
-            if (temperatura === 'aquecendo') { tempIcon = 'trending-up'; tempColor = 'text-emerald-400'; }
-            if (temperatura === 'esfriando') { tempIcon = 'trending-down'; tempColor = 'text-red-400'; }
-            temperaturaHtml = `<div class="flex-1 bg-slate-800/50 border-white/5 border p-2 rounded flex flex-col justify-center items-center"><span class="text-[9px] uppercase font-bold text-slate-500 block mb-1">Temperatura</span><div class="flex items-center gap-1.5 ${tempColor}"><i data-lucide="${tempIcon}" class="w-3 h-3"></i><span class="text-[10px] font-bold uppercase">${temperatura}</span></div></div>`;
+            let tempIcon = 'minus';
+            let tempColor = 'text-yellow-400';
+            let tempText = temperatura;
+
+            if (temperatura === 'aquecendo') { 
+                tempIcon = 'trending-up'; 
+                tempColor = 'text-emerald-400'; 
+            }
+            if (temperatura === 'esfriando') { 
+                tempIcon = 'trending-down'; 
+                tempColor = 'text-red-400'; 
+            }
+
+            temperaturaHtml = `
+                <div class="flex-1 bg-slate-800/50 border-white/5 border p-2 rounded flex flex-col justify-center items-center">
+                    <span class="text-[9px] uppercase font-bold text-slate-500 block mb-1">Temperatura</span>
+                    <div class="flex items-center gap-1.5 ${tempColor}"><i data-lucide="${tempIcon}" class="w-3 h-3"></i><span class="text-[10px] font-bold uppercase">${tempText}</span></div>
+                </div>`;
         }
 
-        const lastTabName = allTabs.length > 0 ? allTabs[allTabs.length-1].title : "Geral";
         const htmlResumo = `
             <div class="space-y-4 font-sans">
                 <div class="flex items-center justify-between mb-2">
-                    <span class="text-[9px] uppercase font-mono text-indigo-300 bg-indigo-500/10 px-2 py-1 rounded border border-indigo-500/20">📅 Fonte: ${lastTabName}</span>
+                    <span class="text-[9px] uppercase font-mono text-indigo-300 bg-indigo-500/10 px-2 py-1 rounded border border-indigo-500/20">
+                        📅 Fonte: ${lastTabName}
+                    </span>
                 </div>
-                <div class="text-xs text-slate-300 leading-relaxed border-l-2 border-indigo-500 pl-3">${data.resumo_executivo}</div>
-                <div class="grid grid-cols-2 gap-2">
-                    <div class="bg-[#0f172a] p-2.5 rounded border border-white/5"><div class="flex items-center gap-2 mb-1"><i data-lucide="brain" class="w-3 h-3 text-purple-400"></i><span class="text-[10px] font-bold text-purple-200 uppercase">Perfil</span></div><p class="text-[10px] text-slate-400 leading-snug">${data.perfil_cliente || "-"}</p></div>
-                    <div class="bg-[#0f172a] p-2.5 rounded border border-white/5"><div class="flex items-center gap-2 mb-1"><i data-lucide="compass" class="w-3 h-3 text-emerald-400"></i><span class="text-[10px] font-bold text-emerald-200 uppercase">Ação</span></div><p class="text-[10px] text-slate-400 leading-snug italic">"${data.estrategia_relacionamento || "-"}"</p></div>
-                </div>
-                <div class="grid grid-cols-1 gap-2">
-                    ${(data.checkpoints_feitos || []).length > 0 ? `<div class="bg-white/[0.02] p-2 rounded border border-white/5"><h4 class="text-[10px] font-bold text-slate-500 uppercase mb-2 flex items-center gap-1"><i data-lucide="check-circle-2" class="w-3 h-3"></i> Concluído (${lastTabName})</h4><ul class="space-y-1">${(data.checkpoints_feitos || []).map(i => `<li class="text-[10px] text-slate-400 flex items-start gap-2"><span class="w-1 h-1 bg-green-500/50 rounded-full mt-1.5"></span><span class="flex-1">${i}</span></li>`).join('')}</ul></div>` : ''}
-                    ${(data.proximos_passos || []).length > 0 ? `<div class="bg-indigo-500/[0.05] p-2 rounded border border-indigo-500/20"><h4 class="text-[10px] font-bold text-indigo-400 uppercase mb-2 flex items-center gap-1"><i data-lucide="arrow-right-circle" class="w-3 h-3"></i> Próximos Passos</h4><ul class="space-y-1">${(data.proximos_passos || []).map(i => `<li class="text-[10px] text-indigo-200 flex items-start gap-2"><span class="w-1 h-1 bg-indigo-400 rounded-full mt-1.5"></span><span class="flex-1">${i}</span></li>`).join('')}</ul></div>` : ''}
-                </div>
-                <div class="flex gap-2 items-stretch">
-                    <div class="flex-1 bg-slate-800/50 border-white/5 border p-2 rounded flex flex-col justify-center"><span class="text-[9px] uppercase font-bold text-slate-500 block mb-1">Riscos</span><p class="text-[10px] text-slate-400 leading-tight">${data.riscos_bloqueios || "Nenhum."}</p></div>
-                    ${temperaturaHtml}
-                    <div class="w-16 flex flex-col items-center justify-center p-1 rounded border ${scoreColor}"><span class="text-[8px] uppercase font-bold opacity-70">Score</span><span class="text-xl font-bold">${score}</span><span class="text-[8px] opacity-70">/10</span></div>
-                </div>
-            </div>`;
 
-        const updatePayload = { doc_link: docUrl, resumo: htmlResumo, pontos_importantes: "Ver card", score_history: updatedHistory, status_cliente: statusCliente, last_updated: new Date() };
-        await supabase.from('empresas').update(updatePayload).eq('id', id);
-        return { success: true, data: { ...updatePayload, id, nome } };
+                <div class="text-xs text-slate-300 leading-relaxed border-l-2 border-indigo-500 pl-3">
+                    ${data.resumo_executivo}
+                </div>
+
+                <div class="grid grid-cols-2 gap-2">
+                    <div class="bg-[#0f172a] p-2.5 rounded border border-white/5 hover:border-indigo-500/30 transition-colors">
+                        <div class="flex items-center gap-2 mb-1">
+                            <i data-lucide="brain" class="w-3 h-3 text-purple-400"></i>
+                            <span class="text-[10px] font-bold text-purple-200 uppercase tracking-wide">Perfil</span>
+                        </div>
+                        <p class="text-[10px] text-slate-400 leading-snug">${data.perfil_cliente || "-"}</p>
+                    </div>
+                    <div class="bg-[#0f172a] p-2.5 rounded border border-white/5 hover:border-emerald-500/30 transition-colors">
+                        <div class="flex items-center gap-2 mb-1">
+                            <i data-lucide="compass" class="w-3 h-3 text-emerald-400"></i>
+                            <span class="text-[10px] font-bold text-emerald-200 uppercase tracking-wide">Ação</span>
+                        </div>
+                        <p class="text-[10px] text-slate-400 leading-snug italic">"${data.estrategia_relacionamento || "-"}"</p>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 gap-2">
+                    ${(data.checkpoints_feitos || []).length > 0 ? `
+                    <div class="bg-white/[0.02] p-2 rounded border border-white/5">
+                        <h4 class="text-[10px] font-bold text-slate-500 uppercase mb-2 flex items-center gap-1"><i data-lucide="check-circle-2" class="w-3 h-3"></i> Concluído (${lastTabName})</h4>
+                        <ul class="space-y-1">
+                            ${(data.checkpoints_feitos || []).map(i => `<li class="text-[10px] text-slate-400 flex items-start gap-2"><span class="w-1 h-1 bg-green-500/50 rounded-full mt-1.5"></span><span class="flex-1">${i}</span></li>`).join('')}
+                        </ul>
+                    </div>` : ''}
+                    
+                    ${(data.proximos_passos || []).length > 0 ? `
+                    <div class="bg-indigo-500/[0.05] p-2 rounded border border-indigo-500/20">
+                        <h4 class="text-[10px] font-bold text-indigo-400 uppercase mb-2 flex items-center gap-1"><i data-lucide="arrow-right-circle" class="w-3 h-3"></i> Próximos Passos</h4>
+                        <ul class="space-y-1">
+                            ${(data.proximos_passos || []).map(i => `<li class="text-[10px] text-indigo-200 flex items-start gap-2"><span class="w-1 h-1 bg-indigo-400 rounded-full mt-1.5"></span><span class="flex-1">${i}</span></li>`).join('')}
+                        </ul>
+                    </div>` : ''}
+                </div>
+
+                <div class="flex gap-2 items-stretch">
+                    <div class="flex-1 bg-slate-800/50 border-white/5 border p-2 rounded flex flex-col justify-center">
+                        <span class="text-[9px] uppercase font-bold text-slate-500 block mb-1">Riscos</span>
+                        <p class="text-[10px] text-slate-400 leading-tight">${data.riscos_bloqueios || "Nenhum."}</p>
+                    </div>
+                    ${temperaturaHtml}
+                    <div class="w-16 flex flex-col items-center justify-center p-1 rounded border ${scoreColor}">
+                        <span class="text-[8px] uppercase font-bold opacity-70">Score</span>
+                        <span class="text-xl font-bold">${score}</span>
+                        <span class="text-[8px] opacity-70">/10</span>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        const updatePayloadForDB = {
+            doc_link: docUrl,
+            resumo: htmlResumo,
+            pontos_importantes: "Ver card",
+            score_history: updatedHistory,
+            status_cliente: statusCliente,
+            last_updated: new Date()
+        };
+
+        await supabase.from('empresas').update(updatePayloadForDB).eq('id', id);
+        
+        const returnPayload = {
+            ...updatePayloadForDB,
+            id: id,
+            nome: nome
+        };
+        return { success: true, data: returnPayload };
 
     } catch (error) {
         console.error(`[ERRO FATAL] para ${nome}:`, error.message);
@@ -357,36 +566,49 @@ app.post('/api/resumir-empresa', async (req, res) => {
     const { nome, id } = req.body;
     try {
         const result = await processCompanyIntelligence(id, nome);
-        if (!result || !result.success) return res.status(500).json(result);
+        if (!result || !result.success) {
+            return res.status(500).json(result);
+        }
         res.json(result);
     } catch (error) {
-        res.status(500).json({ error: "Erro inesperado.", details: error.message });
+        console.error(`[CRASH] em /api/resumir-empresa: ${error.message}`);
+        res.status(500).json({ error: "Erro inesperado no servidor.", details: error.message });
     }
 });
 
+// --- ROTA CRON (ATUALIZAÇÃO DIÁRIA) ---
+// Configure no vercel.json: "crons": [{ "path": "/api/cron/daily-update", "schedule": "59 23 * * *" }]
 app.get('/api/cron/daily-update', async (req, res) => {
     try {
         const { data: companies } = await supabase.from('empresas').select('*');
         if (!companies) return res.json({ message: "Nenhuma empresa." });
+
         const results = [];
         for (const company of companies) {
             const result = await processCompanyIntelligence(company.id, company.nome, company.score_history);
             results.push({ company: company.nome, success: result.success });
         }
         res.json({ status: "Ciclo diário concluído", details: results });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
+// --- ROTA TESTE ---
 app.get('/api/debug-bot', async (req, res) => {
     try {
         const rawToken = getHeadOfficeToken();
-        const response = await axios.get(`${BASE_URL}/openai/question`, { params: { aiName: BOT_NAME, aiId: BOT_ID, question: "Olá" }, headers: { 'Authorization': rawToken } });
+        const response = await axios.get(`${BASE_URL}/openai/question`, {
+            params: { aiName: BOT_NAME, aiId: BOT_ID, question: "Olá" },
+            headers: { 'Authorization': rawToken }
+        });
         res.json({ text: response.data.text, full: response.data });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 module.exports = app;
 
+// --- FRONTEND MANTIDO (IGUAL ANTERIOR) ---
 const DASHBOARD_HTML = `
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -402,14 +624,23 @@ const DASHBOARD_HTML = `
         .glass-card { background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3); transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
         .glass-card:hover { border-color: rgba(99, 102, 241, 0.4); transform: translateY(-4px); box-shadow: 0 20px 40px -10px rgba(99, 102, 241, 0.15); background: rgba(30, 41, 59, 0.7); }
         .badge { padding: 4px 10px; border-radius: 99px; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; border: 1px solid; box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
+        /* Status Cliente */
         .st-ExtremamenteSatisfeito { background: rgba(6, 182, 212, 0.1); color: #22d3ee; border-color: rgba(6, 182, 212, 0.3); }
         .st-Satisfeito { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
         .st-Neutro { background: rgba(234, 179, 8, 0.1); color: #facc15; border-color: rgba(234, 179, 8, 0.3); }
         .st-Insatisfeito { background: rgba(249, 115, 22, 0.1); color: #fb923c; border-color: rgba(249, 115, 22, 0.3); }
         .st-Crítico { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border-color: rgba(239, 68, 68, 0.3); }
         .bg-grid { background-image: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px); background-size: 30px 30px; }
-        .is-unlinked { opacity: 0.6; filter: grayscale(60%); transition: all 0.4s ease-in-out; }
-        .is-unlinked:hover { opacity: 1; filter: grayscale(0%); transform: translateY(-4px); }
+        .is-unlinked {
+            opacity: 0.6;
+            filter: grayscale(60%);
+            transition: all 0.4s ease-in-out;
+        }
+        .is-unlinked:hover {
+            opacity: 1;
+            filter: grayscale(0%);
+            transform: translateY(-4px);
+        }
     </style>
 </head>
 <body class="min-h-screen bg-grid">
@@ -427,14 +658,44 @@ const DASHBOARD_HTML = `
                 </div>
             </div>
             <div class="flex items-center gap-3 w-full md:w-auto flex-wrap justify-end">
-                <div class="relative"><input type="text" id="searchFilter" oninput="applyFilters()" placeholder="Buscar empresa..." class="w-56 bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 block p-2.5 pl-10 transition-all"><i data-lucide="search" class="absolute left-3 top-3 w-4 h-4 text-slate-500 pointer-events-none"></i></div>
-                <div class="relative"><select id="statusFilter" onchange="applyFilters()" class="bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 block p-2.5 pr-8 appearance-none cursor-pointer"><option value="all">Todos</option><option value="Extremamente Satisfeito">Extremamente Satisfeitos</option><option value="Satisfeito">Satisfeitos</option><option value="Neutro">Neutros</option><option value="Insatisfeito">Insatisfeitos</option><option value="Crítico">Críticos</option></select><i data-lucide="filter" class="absolute right-3 top-3 w-4 h-4 text-slate-500 pointer-events-none"></i></div>
-                <div class="relative group"><input type="text" id="newCompanyInput" placeholder="Nova Empresa..." class="w-56 bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 block p-2.5 pl-10 transition-all"><i data-lucide="plus-circle" class="absolute left-3 top-3 w-4 h-4 text-slate-500"></i></div>
-                <button onclick="addCompany()" class="bg-white hover:bg-slate-200 text-slate-900 px-5 py-2.5 rounded-lg text-sm font-bold transition-all shadow-lg hover:shadow-xl flex items-center gap-2">Adicionar</button>
+                <div class="relative">
+                    <input type="text" id="searchFilter" oninput="applyFilters()" placeholder="Buscar empresa..." 
+                        class="w-56 bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 block p-2.5 pl-10 transition-all">
+                    <i data-lucide="search" class="absolute left-3 top-3 w-4 h-4 text-slate-500 pointer-events-none"></i>
+                </div>
+                <div class="relative">
+                    <select id="statusFilter" onchange="applyFilters()" class="bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 block p-2.5 pr-8 appearance-none cursor-pointer">
+                        <option value="all">Todos</option>
+                        <option value="Extremamente Satisfeito">Extremamente Satisfeitos</option>
+                        <option value="Satisfeito">Satisfeitos</option>
+                        <option value="Neutro">Neutros</option>
+                        <option value="Insatisfeito">Insatisfeitos</option>
+                        <option value="Crítico">Críticos</option>
+                    </select>
+                    <i data-lucide="filter" class="absolute right-3 top-3 w-4 h-4 text-slate-500 pointer-events-none"></i>
+                </div>
+                <div class="relative group">
+                    <input type="text" id="newCompanyInput" placeholder="Nova Empresa..." 
+                        class="w-56 bg-slate-900/80 border border-slate-700 text-white text-sm rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 block p-2.5 pl-10 transition-all">
+                    <i data-lucide="plus-circle" class="absolute left-3 top-3 w-4 h-4 text-slate-500"></i>
+                </div>
+                <button onclick="addCompany()" class="bg-white hover:bg-slate-200 text-slate-900 px-5 py-2.5 rounded-lg text-sm font-bold transition-all shadow-lg hover:shadow-xl flex items-center gap-2">
+                    Adicionar
+                </button>
             </div>
         </header>
         <div id="grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-6 pb-20"></div>
-        <div id="historyModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-[100] hidden" onclick="closeModal()"><div class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-2xl shadow-2xl shadow-indigo-500/10" onclick="event.stopPropagation()"><div class="p-5 border-b border-slate-800 flex justify-between items-center"><h3 id="modalTitle" class="text-lg font-bold text-white">Histórico de Sentimento</h3><button onclick="closeModal()" class="text-slate-500 hover:text-white p-2 -mr-2 rounded-full transition-colors"><i data-lucide="x" class="w-5 h-5"></i></button></div><div id="modalContent" class="p-6 bg-slate-900/50 rounded-b-2xl"></div></div></div>
+
+        <div id="historyModal" class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-[100] hidden" onclick="closeModal()">
+            <div class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-2xl shadow-2xl shadow-indigo-500/10" onclick="event.stopPropagation()">
+                <div class="p-5 border-b border-slate-800 flex justify-between items-center">
+                    <h3 id="modalTitle" class="text-lg font-bold text-white">Histórico de Sentimento</h3>
+                    <button onclick="closeModal()" class="text-slate-500 hover:text-white p-2 -mr-2 rounded-full transition-colors"><i data-lucide="x" class="w-5 h-5"></i></button>
+                </div>
+                <div id="modalContent" class="p-6 bg-slate-900/50 rounded-b-2xl">
+                    </div>
+            </div>
+        </div>
     </div>
     <script>
         lucide.createIcons();
@@ -449,33 +710,66 @@ const DASHBOARD_HTML = `
                 const res = await fetch(API_URL + '/api/empresas');
                 const data = await res.json();
                 grid.innerHTML = '';
-                if(data.length === 0) { grid.innerHTML = '<div class="col-span-full text-center text-slate-600 py-32 font-mono">NO ACTIVE CLIENTS.</div>'; return; }
+                if(data.length === 0) { 
+                    grid.innerHTML = '<div class="col-span-full text-center text-slate-600 py-32 font-mono">NO ACTIVE CLIENTS.</div>'; 
+                    return; 
+                }
                 data.forEach(emp => {
-                    const sCli = (emp.status_cliente || 'Neutro').replace(/\\s/g, '');
+                    const sCli = (emp.status_cliente || 'Neutro').replace(/\s/g, '');
                     const historyJson = JSON.stringify(emp.score_history || []);
-                    const contentHtml = emp.resumo && emp.resumo.includes('<div') ? emp.resumo : \`<div class="flex flex-col items-center justify-center h-40 text-slate-500 gap-2"><i data-lucide="ghost" class="w-6 h-6 opacity-30"></i><p class="text-xs">Sem inteligência gerada.</p></div>\`;
+                    const contentHtml = emp.resumo && emp.resumo.includes('<div') 
+                        ? emp.resumo 
+                        : \`<div class="flex flex-col items-center justify-center h-40 text-slate-500 gap-2"><i data-lucide="ghost" class="w-6 h-6 opacity-30"></i><p class="text-xs">Sem inteligência gerada.</p></div>\`;
+                    
+                    // Lógica Extreme para Unlinked (Ghost Mode)
                     const cardClass = emp.doc_link ? 'glass-card' : 'glass-card is-unlinked bg-slate-950/40 border-slate-800';
-                    const iconLink = emp.doc_link ? \`<a href="\${emp.doc_link}" target="_blank" class="text-slate-600 hover:text-white transition-colors p-1 hover:bg-white/10 rounded"><i data-lucide="file-text" class="w-4 h-4"></i></a>\` : \`<span class="text-slate-700 cursor-not-allowed" title="Sem Link"><i data-lucide="link-2-off" class="w-4 h-4"></i></span>\`;
+                    const iconLink = emp.doc_link 
+                        ? \`<a href="\${emp.doc_link}" target="_blank" class="text-slate-600 hover:text-white transition-colors p-1 hover:bg-white/10 rounded"><i data-lucide="file-text" class="w-4 h-4"></i></a>\` 
+                        : \`<span class="text-slate-700 cursor-not-allowed" title="Sem Link"><i data-lucide="link-2-off" class="w-4 h-4"></i></span>\`;
 
                     grid.innerHTML += \`
                     <div id="card-\${emp.id}" class="\${cardClass} rounded-2xl flex flex-col h-full relative group company-card" data-status="\${emp.status_cliente || 'Neutro'}">
                         <div class="p-5 pb-3 border-b border-white/5">
-                            <div class="flex justify-between items-start mb-3"><h2 class="font-bold text-white text-lg tracking-tight truncate w-10/12 group-hover:text-indigo-300 transition-colors" title="\${emp.nome}">\${emp.nome}</h2>\${iconLink}</div>
-                            <div class="flex gap-2"><span class="badge st-\${sCli}">\${emp.status_cliente || 'PENDENTE'}</span></div>
+                            <div class="flex justify-between items-start mb-3">
+                                <h2 class="font-bold text-white text-lg tracking-tight truncate w-10/12 group-hover:text-indigo-300 transition-colors" title="\${emp.nome}">\${emp.nome}</h2>
+                                \${iconLink}
+                            </div>
+                            <div class="flex gap-2">
+                                <span class="badge st-\${sCli}">\${emp.status_cliente || 'PENDENTE'}</span>
+                            </div>
                         </div>
-                        <div class="p-5 flex-grow text-sm">\${contentHtml}</div>
+                        <div class="p-5 flex-grow text-sm">
+                            \${contentHtml}
+                        </div>
                         <div class="p-4 mt-auto border-t border-white/5 bg-slate-900/30 rounded-b-2xl flex flex-col gap-3">
                             <div class="flex gap-2">
-                                <button onclick="summarize('\${emp.nome.replace(/'/g, "\\\\'")}', \${emp.id})" id="btn-\${emp.id}" class="flex-grow bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5 group-hover:border-indigo-500/30"><i data-lucide="zap" class="w-3 h-3"></i> \${emp.resumo ? 'REPROCESSAR' : 'ANALISAR'}</button>
-                                <button onclick='if((emp.score_history || []).length > 1) openHistoryModal(\${historyJson}, \`\${emp.nome.replace(/'/g, "\\\\'")}\`)' class="w-12 flex-shrink-0 flex items-center justify-center bg-slate-800 rounded-lg border border-white/5 \${(emp.score_history || []).length > 1 ? 'hover:bg-indigo-600 hover:border-indigo-500/30 cursor-pointer' : 'opacity-50 cursor-not-allowed'}" title="Ver Histórico de Score"><i data-lucide="bar-chart-3" class="w-4 h-4 text-slate-300"></i></button>
+                                <button onclick="summarize('\${emp.nome.replace(/'/g, "\\\\'")}', \${emp.id})" id="btn-\${emp.id}" 
+                                    class="flex-grow bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5 group-hover:border-indigo-500/30">
+                                    <i data-lucide="zap" class="w-3 h-3"></i> 
+                                    \${emp.resumo ? 'REPROCESSAR' : 'ANALISAR'}
+                                </button>
+                                <button 
+                                    onclick='if((emp.score_history || []).length > 1) openHistoryModal(\${historyJson}, \`\${emp.nome.replace(/'/g, "\\\\'")}\`)'
+                                    class="w-12 flex-shrink-0 flex items-center justify-center bg-slate-800 rounded-lg border border-white/5 \${(emp.score_history || []).length > 1 ? 'hover:bg-indigo-600 hover:border-indigo-500/30 cursor-pointer' : 'opacity-50 cursor-not-allowed'}"
+                                    title="Ver Histórico de Score">
+                                    <i data-lucide="bar-chart-3" class="w-4 h-4 text-slate-300"></i>
+                                </button>
                             </div>
-                            <div class="flex justify-between items-center px-1"><span class="text-[9px] text-slate-600 uppercase font-bold tracking-wider">Last Sync</span><span class="text-[9px] text-slate-500 font-mono">\${emp.last_updated ? new Date(emp.last_updated).toLocaleDateString() : '--/--'}</span></div>
+                            <div class="flex justify-between items-center px-1">
+                                <span class="text-[9px] text-slate-600 uppercase font-bold tracking-wider">Last Sync</span>
+                                <span class="text-[9px] text-slate-500 font-mono">
+                                    \${emp.last_updated ? new Date(emp.last_updated).toLocaleDateString() : '--/--'}
+                                </span>
+                            </div>
                         </div>
                     </div>\`;
                 });
                 lucide.createIcons();
+                // Reaplicar filtros se houver
                 applyFilters();
-            } catch (e) { grid.innerHTML = '<div class="col-span-full text-center text-red-400 font-mono py-20">SYSTEM FAILURE: API UNREACHABLE.</div>'; }
+            } catch (e) { 
+                grid.innerHTML = '<div class="col-span-full text-center text-red-400 font-mono py-20">SYSTEM FAILURE: API UNREACHABLE.</div>'; 
+            }
         }
         function applyFilters() {
             const statusFilter = document.getElementById('statusFilter').value;
@@ -484,28 +778,64 @@ const DASHBOARD_HTML = `
             cards.forEach(card => {
                 const status = card.getAttribute('data-status');
                 const name = card.querySelector('h2').getAttribute('title').toLowerCase();
+                
                 const statusMatch = (statusFilter === 'all' || status === statusFilter);
                 const nameMatch = name.includes(searchFilter);
-                if (statusMatch && nameMatch) { card.style.display = 'flex'; } else { card.style.display = 'none'; }
+
+                if (statusMatch && nameMatch) {
+                    card.style.display = 'flex';
+                } else {
+                    card.style.display = 'none';
+                }
             });
         }
         async function summarize(nome, id) {
             const btn = document.getElementById('btn-' + id);
             const card = document.getElementById('card-' + id);
             const originalHTML = btn.innerHTML;
+            
+            // Estado de Carregamento Individual
             btn.disabled = true; 
             btn.className = "w-full bg-indigo-600/20 text-indigo-300 py-2.5 rounded-lg text-xs font-bold flex justify-center items-center gap-2 cursor-wait border border-indigo-500/30 animate-pulse";
-            btn.innerHTML = '<i data-lucide="loader-2" class="animate-spin w-3 h-3"></i> EXTRAINDO...';
-            if(card) { card.classList.add("animate-pulse", "ring-2", "ring-indigo-500/50"); card.style.borderColor = "rgba(99, 102, 241, 0.5)"; }
+            btn.innerHTML = '<i data-lucide="loader-2" class="animate-spin w-3 h-3"></i> EXTRAINDO INTELIGÊNCIA...';
+            
+            // Animação de Pulso no Card
+            if(card) {
+                card.classList.add("animate-pulse", "ring-2", "ring-indigo-500/50");
+                card.style.borderColor = "rgba(99, 102, 241, 0.5)";
+            }
+
             lucide.createIcons();
             try {
-                const res = await fetch(API_URL + '/api/resumir-empresa', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nome, id }) });
+                const res = await fetch(API_URL + '/api/resumir-empresa', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ nome, id })
+                });
                 const json = await res.json();
-                if (json.success) { loadCompanies(); } else { alert('Erro: ' + (json.details || json.error)); btn.innerHTML = 'FALHA'; btn.className = "w-full bg-red-900/20 text-red-400 border border-red-500/30 py-2.5 rounded-lg text-xs font-bold"; }
-            } catch (e) { btn.innerHTML = 'ERRO DE CONEXÃO'; } finally { 
+                if (json.success) { 
+                    loadCompanies(); 
+                } else { 
+                    alert('Erro: ' + (json.details || json.error)); 
+                    btn.innerHTML = 'FALHA NA EXTRAÇÃO';
+                    btn.className = "w-full bg-red-900/20 text-red-400 border border-red-500/30 py-2.5 rounded-lg text-xs font-bold";
+                }
+            } catch (e) { 
+                btn.innerHTML = 'ERRO DE CONEXÃO';
+            } finally { 
                 if(!btn.innerHTML.includes('FALHA') && !btn.innerHTML.includes('ERRO')) {
+                    // O loadCompanies vai regravar o HTML, então não precisamos resetar o botão manualmente se der sucesso
                 } else {
-                    setTimeout(() => { btn.disabled = false; btn.innerHTML = originalHTML; btn.className = "w-full bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5"; if(card) { card.classList.remove("animate-pulse", "ring-2", "ring-indigo-500/50"); card.style.borderColor = ""; } lucide.createIcons(); }, 3000);
+                    setTimeout(() => { 
+                        btn.disabled = false; 
+                        btn.innerHTML = originalHTML; 
+                        btn.className = "w-full bg-slate-800 hover:bg-indigo-600 text-slate-300 hover:text-white py-2.5 rounded-lg text-xs font-bold tracking-wide transition-all flex justify-center items-center gap-2 border border-white/5";
+                        if(card) {
+                            card.classList.remove("animate-pulse", "ring-2", "ring-indigo-500/50");
+                            card.style.borderColor = "";
+                        }
+                        lucide.createIcons();
+                    }, 3000);
                 }
             }
         }
@@ -513,25 +843,69 @@ const DASHBOARD_HTML = `
             const input = document.getElementById('newCompanyInput');
             const nome = input.value.trim();
             if(!nome) return;
-            try { const res = await fetch(API_URL + '/api/empresas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nome }) }); const json = await res.json(); if(json.success) { input.value = ''; loadCompanies(); } } catch(e) {}
+            try {
+                const res = await fetch(API_URL + '/api/empresas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nome }) });
+                const json = await res.json();
+                if(json.success) { input.value = ''; loadCompanies(); }
+            } catch(e) {}
         }
+
+        // --- Modal & Chart Logic ---
         function openHistoryModal(history, companyName) {
             if (!history || history.length < 2) return;
             const modal = document.getElementById('historyModal');
-            document.getElementById('modalTitle').innerText = \`Histórico: \${companyName}\`;
-            document.getElementById('modalContent').innerHTML = generateChartSVG(history);
+            const title = document.getElementById('modalTitle');
+            const content = document.getElementById('modalContent');
+
+            title.innerText = \`Histórico de Sentimento: \${companyName}\`;
+            content.innerHTML = generateChartSVG(history);
             modal.classList.remove('hidden');
+            lucide.createIcons();
         }
-        function closeModal() { document.getElementById('historyModal').classList.add('hidden'); }
+
+        function closeModal() {
+            document.getElementById('historyModal').classList.add('hidden');
+        }
+
         function generateChartSVG(history) {
-            if (!history || history.length < 2) return \`<div class="text-center text-slate-500 py-10">Dados insuficientes.</div>\`;
+            if (!history || history.length < 2) {
+                return \`<div class="text-center text-slate-500 py-10">Dados insuficientes para gerar gráfico (mínimo de 2 registros).</div>\`;
+            }
             const W = 570, H = 250, PADDING = 40;
-            const points = history.map((p, i) => ({ x: PADDING + i * (W - 2 * PADDING) / (history.length - 1), y: H - PADDING - (p.score / 10) * (H - 2 * PADDING), score: p.score, date: new Date(p.date) }));
+            const points = history.map((p, i) => ({
+                x: PADDING + i * (W - 2 * PADDING) / (history.length - 1),
+                y: H - PADDING - (p.score / 10) * (H - 2 * PADDING),
+                score: p.score,
+                date: new Date(p.date)
+            }));
+
             const pathD = "M" + points.map(p => \`\${p.x.toFixed(2)} \${p.y.toFixed(2)}\`).join(" L");
-            const circles = points.map(p => \`<g transform="translate(\${p.x}, \${p.y})"><circle cx="0" cy="0" r="8" fill="#6366f1" fill-opacity="0.2" /><circle cx="0" cy="0" r="4" fill="#a5b4fc" stroke="#0f172a" stroke-width="2" /></g>\`).join('');
-            const xLabels = points.map((p, i) => { if (history.length > 10 && i % 2 !== 0 && i !== history.length - 1 && i !== 0) return ''; const dateStr = p.date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }); return \`<text x="\${p.x}" y="\${H - PADDING + 20}" fill="#94a3b8" font-size="10" text-anchor="middle">\${dateStr}</text>\`; }).join('');
-            const yLabels = [0, 2, 4, 6, 8, 10].map(score => { const y = H - PADDING - (score / 10) * (H - 2 * PADDING); return \`<text x="\${PADDING - 10}" y="\${y}" fill="#94a3b8" font-size="10" text-anchor="end" dominant-baseline="middle">\${score}</text><line x1="\${PADDING}" y1="\${y}" x2="\${W - PADDING}" y2="\${y}" stroke="#334155" stroke-width="0.5" />\`; }).join('');
-            return \`<svg width="100%" height="\${H}" viewBox="0 0 \${W} \${H}">\${yLabels}<path d="\${pathD}" fill="none" stroke="#6366f1" stroke-width="2" />\${circles}\${xLabels}</svg>\`;
+
+            const circles = points.map(p => 
+                \`<g transform="translate(\${p.x}, \${p.y})">
+                    <circle cx="0" cy="0" r="8" fill="#6366f1" fill-opacity="0.2" />
+                    <circle cx="0" cy="0" r="4" fill="#a5b4fc" stroke="#0f172a" stroke-width="2" />
+                </g>\`
+            ).join('');
+
+            const xLabels = points.map((p, i) => {
+                if (history.length > 10 && i % 2 !== 0 && i !== history.length - 1 && i !== 0) return '';
+                const dateStr = p.date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+                return \`<text x="\${p.x}" y="\${H - PADDING + 20}" fill="#94a3b8" font-size="10" text-anchor="middle">\${dateStr}</text>\`;
+            }).join('');
+
+            const yLabels = [0, 2, 4, 6, 8, 10].map(score => {
+                const y = H - PADDING - (score / 10) * (H - 2 * PADDING);
+                return \`<text x="\${PADDING - 10}" y="\${y}" fill="#94a3b8" font-size="10" text-anchor="end" dominant-baseline="middle">\${score}</text>
+                        <line x1="\${PADDING}" y1="\${y}" x2="\${W - PADDING}" y2="\${y}" stroke="#334155" stroke-width="0.5" />\`;
+            }).join('');
+
+            return \`<svg width="100%" height="\${H}" viewBox="0 0 \${W} \${H}">
+                \${yLabels}
+                <path d="\${pathD}" fill="none" stroke="#6366f1" stroke-width="2" />
+                \${circles}
+                \${xLabels}
+            </svg>\`;
         }
         loadCompanies();
     </script>
